@@ -33,12 +33,7 @@ pub struct HeightField {
 /// quantized to 8-bit — it trades banding for imperceptible high-frequency noise, so a smooth
 /// gradient that would terrace at 8-bit stays visually smooth. Unused on the 16-bit/EXR paths,
 /// where 65,536+ levels make dithering pointless.
-const BAYER4: [[f32; 4]; 4] = [
-    [0.0, 8.0, 2.0, 10.0],
-    [12.0, 4.0, 14.0, 6.0],
-    [3.0, 11.0, 1.0, 9.0],
-    [15.0, 7.0, 13.0, 5.0],
-];
+const BAYER4: [[f32; 4]; 4] = [[0.0, 8.0, 2.0, 10.0], [12.0, 4.0, 14.0, 6.0], [3.0, 11.0, 1.0, 9.0], [15.0, 7.0, 13.0, 5.0]];
 
 /// The Bayer threshold at `(x, y)` normalized to `0.0..1.0`.
 fn bayer4(x: usize, y: usize) -> f32 {
@@ -405,11 +400,7 @@ mod tests {
 
         // Contrast: the discredited "widen 8-bit by ×257" path can only ever produce ≤256
         // distinct values across the identical ramp — this is the banding we're eliminating.
-        let fake_levels: HashSet<u16> = hf
-            .samples()
-            .iter()
-            .map(|v| ((v.clamp(0.0, 1.0) * 255.0).round() as u16) * 257)
-            .collect();
+        let fake_levels: HashSet<u16> = hf.samples().iter().map(|v| ((v.clamp(0.0, 1.0) * 255.0).round() as u16) * 257).collect();
         assert!(fake_levels.len() <= 256, "×257 path is capped at 256, got {}", fake_levels.len());
         assert!(real_levels.len() > fake_levels.len() * 4, "16-bit must resolve far more than the 8-bit path");
     }
@@ -506,7 +497,11 @@ mod tests {
         let hf = HeightField::from_vec(data, side).expect("square");
         let lp = hf.low_pass(4);
         let mid = 16 * side + 16;
-        assert!((lp.samples()[mid] - 0.5).abs() < 0.15, "high freq flattened toward mean, got {}", lp.samples()[mid]);
+        assert!(
+            (lp.samples()[mid] - 0.5).abs() < 0.15,
+            "high freq flattened toward mean, got {}",
+            lp.samples()[mid]
+        );
         // A constant field is (numerically) unchanged.
         let flat = HeightField::filled(side, 0.3);
         assert!(flat.low_pass(5).samples().iter().all(|v| (v - 0.3).abs() < 1e-4), "flat stays flat");

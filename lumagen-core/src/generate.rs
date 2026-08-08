@@ -82,10 +82,7 @@ impl Default for DepthReconstruct {
     fn default() -> Self {
         Self {
             // Depth Anything = robust global structure; Marigold = finer macro detail.
-            depth_models: vec![
-                "fal-ai/image-preprocessors/depth-anything/v2".into(),
-                "fal-ai/imageutils/marigold-depth".into(),
-            ],
+            depth_models: vec!["fal-ai/image-preprocessors/depth-anything/v2".into(), "fal-ai/imageutils/marigold-depth".into()],
             // PATINA (texture→PBR) supplies the micro normal; `maps: ["normal"]` so it computes
             // only that. Cleared → local high-pass derivation instead.
             normal_model: "fal-ai/patina".into(),
@@ -326,16 +323,14 @@ impl MapGenerator {
         // The estimators read the highest-resolution albedo available (native master when
         // present) so the reconstruction lands at export resolution. Captured here because the
         // reference-PNG encode below consumes `albedo_master`.
-        let depth_src: Option<(Vec<u8>, usize)> = (want_depth || want_normal)
-            .then(|| albedo_master.as_ref().map(|(p, s)| (p.clone(), *s)).unwrap_or_else(|| (albedo.clone(), size)));
+        let depth_src: Option<(Vec<u8>, usize)> =
+            (want_depth || want_normal).then(|| albedo_master.as_ref().map(|(p, s)| (p.clone(), *s)).unwrap_or_else(|| (albedo.clone(), size)));
 
         // ── 3. Semantic (AI) maps (roughness/metallic/emission) concurrently via the provider ──
         let semantic: Vec<MapId> = MapId::DERIVED
             .iter()
             .copied()
-            .filter(|id| {
-                target.contains(id) && plan.paths[id.index()] == DerivePath::Ai && !matches!(id, MapId::Displacement | MapId::Normal)
-            })
+            .filter(|id| target.contains(id) && plan.paths[id.index()] == DerivePath::Ai && !matches!(id, MapId::Displacement | MapId::Normal))
             .collect();
 
         let ref_side = albedo_master.as_ref().map(|m| m.1).unwrap_or(size);
@@ -1070,7 +1065,10 @@ mod tests {
         let mut paths = std::array::from_fn(|i| derive::default_path(MapId::ALL[i]));
         paths[MapId::Displacement.index()] = DerivePath::Ai;
         paths[MapId::Normal.index()] = DerivePath::Ai;
-        let plan = GenerationPlan { paths, ..GenerationPlan::default() };
+        let plan = GenerationPlan {
+            paths,
+            ..GenerationPlan::default()
+        };
         let (tx, mut rx) = mpsc::unbounded_channel();
         generator
             .generate_material(
@@ -1091,12 +1089,22 @@ mod tests {
         let mut normal_ready = false;
         while let Some(o) = rx.recv().await {
             match o {
-                MapOutcome::Ready { map: MapId::Displacement, rgba, height, .. } => {
+                MapOutcome::Ready {
+                    map: MapId::Displacement,
+                    rgba,
+                    height,
+                    ..
+                } => {
                     assert_eq!(rgba.len(), size * size * 4, "displacement preview at working size");
                     assert!(height.is_some(), "the depth path must carry an f32 height master");
                     disp_has_height = true;
                 }
-                MapOutcome::Ready { map: MapId::Normal, rgba, height, .. } => {
+                MapOutcome::Ready {
+                    map: MapId::Normal,
+                    rgba,
+                    height,
+                    ..
+                } => {
                     assert_eq!(rgba.len(), size * size * 4, "normal at working size");
                     assert!(height.is_none(), "the micro normal carries no height master");
                     normal_ready = true;

@@ -1417,13 +1417,11 @@ fn depth_model_combo(ui: &mut Ui, state: &mut AppState) {
     use crate::state::DepthMode;
     widgets::field_label(ui, "Depth model", None);
     let mut mode = state.map(MapId::Displacement).depth_mode;
-    let resp = egui::ComboBox::from_id_salt("depth_model")
-        .selected_text(mode.label())
-        .show_ui(ui, |ui| {
-            for m in [DepthMode::Blend, DepthMode::Marigold, DepthMode::DepthAnything, DepthMode::Local] {
-                ui.selectable_value(&mut mode, m, m.label());
-            }
-        });
+    let resp = egui::ComboBox::from_id_salt("depth_model").selected_text(mode.label()).show_ui(ui, |ui| {
+        for m in [DepthMode::Blend, DepthMode::Marigold, DepthMode::DepthAnything, DepthMode::Local] {
+            ui.selectable_value(&mut mode, m, m.label());
+        }
+    });
     if resp.response.changed() {
         state.map_mut(MapId::Displacement).depth_mode = mode;
     }

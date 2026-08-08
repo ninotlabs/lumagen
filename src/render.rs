@@ -490,7 +490,13 @@ fn run_worker(rx: Receiver<Task>, tx: Sender<Output>, ctx: egui::Context) {
                 Output::Io(IoResult::Exported(result))
             }
             Task::Io(IoTask::SaveDoc(job)) => {
-                let SaveJob { path, mut doc, maps, displacement_height, announce } = *job;
+                let SaveJob {
+                    path,
+                    mut doc,
+                    maps,
+                    displacement_height,
+                    announce,
+                } = *job;
                 // A map that fails to encode fails the whole save — a document silently
                 // missing a map would masquerade as a good backup. Untouched masters pass
                 // their stored PNG section through byte-identical (no decode/re-encode).

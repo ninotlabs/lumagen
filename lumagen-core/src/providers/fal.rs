@@ -802,7 +802,9 @@ mod tests {
         };
         let body = FalProvider::build_estimate_body(&req).expect("body");
         assert!(
-            body.get("image_url").and_then(|v| v.as_str()).is_some_and(|u| u.starts_with("data:image/png;base64,")),
+            body.get("image_url")
+                .and_then(|v| v.as_str())
+                .is_some_and(|u| u.starts_with("data:image/png;base64,")),
             "image_url must be a PNG data URI"
         );
         assert_eq!(body.get("ensemble_size").and_then(|v| v.as_i64()), Some(10));

@@ -1758,7 +1758,13 @@ impl AppState {
     fn apply_generated(&mut self, ctx: &egui::Context, outcome: lumagen_core::generate::MapOutcome) {
         use lumagen_core::generate::MapOutcome;
         match outcome {
-            MapOutcome::Ready { map, rgba, master, height, cost } => {
+            MapOutcome::Ready {
+                map,
+                rgba,
+                master,
+                height,
+                cost,
+            } => {
                 let was_upscale = self.upscaling.remove(&map);
                 // Only a generation result may retire generation state — an upscale finishing
                 // mid-regeneration must not clobber the regen's cancel token or progress.
