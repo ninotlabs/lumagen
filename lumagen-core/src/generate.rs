@@ -51,9 +51,16 @@ pub struct DepthReconstruct {
     /// Depth estimator endpoint slugs, `[global, detail]`. Two → blended best-of-both (robust
     /// global structure from the first, finer macro detail from the second); one → used alone.
     pub depth_models: Vec<String>,
-    /// Surface-normal estimator endpoint slug for the micro normal. Empty → derive the micro
-    /// normal locally from the albedo instead of calling a provider.
+    /// Surface-normal estimator endpoint slug for the micro normal (default `fal-ai/patina`, a
+    /// texture→PBR extractor). Empty → derive the micro normal locally from the albedo instead
+    /// of calling a provider.
     pub normal_model: String,
+    /// How to read the normal image from the estimator's response (PATINA tags it by
+    /// `map_type`; MiDaS uses a named field).
+    pub normal_output: crate::providers::EstimateOutput,
+    /// Extra params for the normal request (PATINA's `maps: ["normal"]` so it computes only the
+    /// normal). `Null` sends none.
+    pub normal_extra: serde_json::Value,
     /// Invert the depth near/far convention.
     pub invert: bool,
     /// Best-of-both blend crossover as a FRACTION of side (resolution-independent) — the band
@@ -76,7 +83,11 @@ impl Default for DepthReconstruct {
                 "fal-ai/image-preprocessors/depth-anything/v2".into(),
                 "fal-ai/imageutils/marigold-depth".into(),
             ],
-            normal_model: String::new(),
+            // PATINA (texture→PBR) supplies the micro normal; `maps: ["normal"]` so it computes
+            // only that. Cleared → local high-pass derivation instead.
+            normal_model: "fal-ai/patina".into(),
+            normal_output: crate::providers::EstimateOutput::MapType("normal".into()),
+            normal_extra: crate::providers::obj(&[("maps", serde_json::Value::Array(vec!["normal".into()]))]),
             invert: false,
             blend_radius: 0.02,
             crossover_radius: 0.01,
@@ -883,6 +894,7 @@ async fn reconstruct_depth(
             side,
             model: model.clone(),
             extra: depth.depth_extra.clone(),
+            output: crate::providers::EstimateOutput::Image,
         };
         let progress: &crate::providers::ProgressFn = &|_p| {};
         let resp = call_with_retry(retries, &cancel, || provider.estimate(&req, cancel.child_token(), progress)).await?;
@@ -925,7 +937,8 @@ async fn reconstruct_micro_normal(
             rgba: albedo.to_vec(),
             side,
             model: depth.normal_model.clone(),
-            extra: serde_json::Value::Null,
+            extra: depth.normal_extra.clone(),
+            output: depth.normal_output.clone(),
         };
         let progress: &crate::providers::ProgressFn = &|_p| {};
         let resp = call_with_retry(retries, &cancel, || provider.estimate(&req, cancel.child_token(), progress)).await?;

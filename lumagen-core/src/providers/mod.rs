@@ -590,12 +590,28 @@ pub struct EstimateRequest {
     /// Source side length.
     pub side: usize,
     /// The estimator endpoint id (e.g. `fal-ai/imageutils/marigold-depth`,
-    /// `fal-ai/image-preprocessors/depth-anything/v2`). Configurable per the same rule as
-    /// generation slugs — never hardcoded as the only option.
+    /// `fal-ai/image-preprocessors/depth-anything/v2`, `fal-ai/patina`). Configurable per the
+    /// same rule as generation slugs — never hardcoded as the only option.
     pub model: String,
     /// Endpoint-specific params merged into the request body (Marigold's `ensemble_size`,
-    /// `num_inference_steps`, `processing_res`; `Null` sends none).
+    /// `num_inference_steps`, `processing_res`; PATINA's `maps`; `Null` sends none).
     pub extra: serde_json::Value,
+    /// Which result the endpoint returns and how to pick the wanted image from it. Depth models
+    /// return a single top-level `image`; PATINA returns a tagged `images[]` array.
+    pub output: EstimateOutput,
+}
+
+/// How an estimator's response carries the wanted image — endpoints differ, so the caller
+/// declares which shape to read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EstimateOutput {
+    /// A single top-level `image` File — Marigold, Depth Anything.
+    Image,
+    /// A single named top-level File field, e.g. `normal_map` / `depth_map` — MiDaS.
+    Field(String),
+    /// The entry in an `images[]` array whose `map_type` equals this — PATINA (a multi-map
+    /// PBR extractor returning one tagged image per requested map).
+    MapType(String),
 }
 
 /// Estimated cost of one Topaz upscale by OUTPUT megapixels (fal's published tier table:

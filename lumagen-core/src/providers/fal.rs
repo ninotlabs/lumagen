@@ -5,8 +5,8 @@
 //! fal returns (`status_url`/`response_url`/`cancel_url`) so path changes don't break us.
 
 use super::{
-    BackendParams, EstimateRequest, ImageData, ImageProvider, ImageRequest, ImageResponse, ImageSpec, JobProgress, OutputImage, ProviderError, ProviderId,
-    RequestKind, UpscaleRequest,
+    BackendParams, EstimateOutput, EstimateRequest, ImageData, ImageProvider, ImageRequest, ImageResponse, ImageSpec, JobProgress, OutputImage, ProviderError,
+    ProviderId, RequestKind, UpscaleRequest,
 };
 
 const QUEUE_BASE: &str = "https://queue.fal.run";
@@ -603,15 +603,10 @@ impl ImageProvider for FalProvider {
         }
         let sub: SubmitResponse = submit.json().await?;
         let raw = self.poll_and_fetch(&sub, &cancel, progress).await?;
-        let file_url = raw.pointer("/image/url").and_then(|u| u.as_str()).ok_or(ProviderError::Empty)?.to_string();
+        let image = Self::select_estimate_image(&raw, &req.output).ok_or(ProviderError::Empty)?;
         progress(JobProgress::Done);
         Ok(ImageResponse {
-            images: vec![OutputImage {
-                data: ImageData::Url(file_url),
-                width: raw.pointer("/image/width").and_then(|w| w.as_u64()).map(|w| w as u32),
-                height: raw.pointer("/image/height").and_then(|h| h.as_u64()).map(|h| h as u32),
-                content_type: raw.pointer("/image/content_type").and_then(|c| c.as_str()).map(str::to_string),
-            }],
+            images: vec![image],
             seed: None,
             cost: None,
             raw,
@@ -620,6 +615,39 @@ impl ImageProvider for FalProvider {
 
     fn id(&self) -> ProviderId {
         ProviderId::Fal
+    }
+}
+
+impl FalProvider {
+    /// Pick the wanted image out of an estimator's result JSON per the declared output shape: a
+    /// single top-level `image` (depth models), a named File field (MiDaS), or the `images[]`
+    /// entry tagged with a `map_type` (PATINA). A `sync_mode` data URI is decoded inline.
+    fn select_estimate_image(raw: &serde_json::Value, output: &EstimateOutput) -> Option<OutputImage> {
+        let node = match output {
+            EstimateOutput::Image => raw.get("image")?,
+            EstimateOutput::Field(field) => raw.get(field)?,
+            EstimateOutput::MapType(map_type) => raw
+                .get("images")?
+                .as_array()?
+                .iter()
+                .find(|im| im.get("map_type").and_then(|t| t.as_str()) == Some(map_type.as_str()))?,
+        };
+        let url = node.get("url")?.as_str()?;
+        let data = if let Some((mime, b64)) = super::parse_data_uri(url) {
+            use base64::Engine as _;
+            ImageData::Base64 {
+                data: base64::engine::general_purpose::STANDARD.decode(b64).ok()?,
+                mime: mime.to_string(),
+            }
+        } else {
+            ImageData::Url(url.to_string())
+        };
+        Some(OutputImage {
+            data,
+            width: node.get("width").and_then(|w| w.as_u64()).map(|w| w as u32),
+            height: node.get("height").and_then(|h| h.as_u64()).map(|h| h as u32),
+            content_type: node.get("content_type").and_then(|c| c.as_str()).map(str::to_string),
+        })
     }
 }
 
@@ -770,6 +798,7 @@ mod tests {
             side: 8,
             model: "fal-ai/imageutils/marigold-depth".into(),
             extra: crate::providers::obj(&[("ensemble_size", 10.into()), ("num_inference_steps", 12.into())]),
+            output: EstimateOutput::Image,
         };
         let body = FalProvider::build_estimate_body(&req).expect("body");
         assert!(
@@ -778,6 +807,36 @@ mod tests {
         );
         assert_eq!(body.get("ensemble_size").and_then(|v| v.as_i64()), Some(10));
         assert_eq!(body.get("num_inference_steps").and_then(|v| v.as_i64()), Some(12));
+    }
+
+    /// The output selector reads each endpoint's result shape: PATINA's `images[]` by
+    /// `map_type`, and a depth model's single top-level `image`.
+    #[test]
+    fn select_estimate_image_reads_each_output_shape() {
+        let patina: serde_json::Value = serde_json::from_str(
+            r#"{"images":[
+                {"url":"https://x/basecolor.png","map_type":"basecolor"},
+                {"url":"https://x/normal.png","map_type":"normal","width":1024,"height":1024}
+            ],"seed":7}"#,
+        )
+        .expect("json");
+        let img = FalProvider::select_estimate_image(&patina, &EstimateOutput::MapType("normal".into())).expect("normal picked");
+        match img.data {
+            ImageData::Url(u) => assert!(u.ends_with("normal.png"), "got {u}"),
+            ImageData::Base64 { .. } => panic!("expected a url, got inline base64"),
+        }
+        assert_eq!(img.width, Some(1024));
+        assert!(
+            FalProvider::select_estimate_image(&patina, &EstimateOutput::MapType("height".into())).is_none(),
+            "an unrequested map_type is absent"
+        );
+
+        let depth: serde_json::Value = serde_json::from_str(r#"{"image":{"url":"https://x/d.png"}}"#).expect("json");
+        let d = FalProvider::select_estimate_image(&depth, &EstimateOutput::Image).expect("image");
+        match d.data {
+            ImageData::Url(u) => assert!(u.ends_with("d.png"), "got {u}"),
+            ImageData::Base64 { .. } => panic!("expected a url, got inline base64"),
+        }
     }
 
     /// The published cost tiers by output megapixels.

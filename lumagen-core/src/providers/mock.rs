@@ -149,6 +149,7 @@ mod tests {
                 side,
                 model: "mock".into(),
                 extra: serde_json::Value::Null,
+                output: crate::providers::EstimateOutput::Image,
             };
             let progress = |_p: JobProgress| {};
             let resp = MockProvider
