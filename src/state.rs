@@ -121,16 +121,20 @@ pub struct Version {
     pub master: Option<(std::sync::Arc<Vec<u8>>, usize)>,
 }
 
-/// Which depth model(s) reconstruct the macro displacement when it's on the AI path. A
-/// per-material override; the default `Blend` runs both and keeps best-of-both (robust global
-/// structure + finer macro detail).
+/// Which model reconstructs the macro displacement when it's on the AI path. A per-material
+/// override. The default `Patina` uses the texture→PBR extractor's HEIGHT output, which is
+/// aligned to the actual surface structure (tiles, seams); the scene-depth models (Marigold /
+/// Depth Anything) are trained on photographs and read a flat orthographic albedo as vague soft
+/// blobs, so they're kept only as alternatives.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DepthMode {
-    /// Run both hosted models, blended best-of-both.
+    /// PATINA's texture→PBR height — structure-aligned; the same model that draws the normal.
+    Patina,
+    /// Run both scene-depth models, blended best-of-both.
     Blend,
-    /// Marigold only (diffusion; finest macro detail).
+    /// Marigold only (diffusion scene depth).
     Marigold,
-    /// Depth Anything V2 only (robust, fast).
+    /// Depth Anything V2 only (robust, fast scene depth).
     DepthAnything,
     /// Local Depth Anything V2 via ONNX — offline, true raw float (needs the `onnx` build
     /// feature + a local model).
@@ -138,14 +142,16 @@ pub enum DepthMode {
 }
 
 impl DepthMode {
+    const PATINA: &'static str = "fal-ai/patina";
     const MARIGOLD: &'static str = "fal-ai/imageutils/marigold-depth";
     const DEPTH_ANYTHING: &'static str = "fal-ai/image-preprocessors/depth-anything/v2";
     const LOCAL: &'static str = "local:depth-anything-v2";
 
     /// The estimator slugs this mode drives, as `[global, detail]` for the blend. The `local:`
-    /// prefix routes to the offline ONNX engine instead of a provider.
+    /// prefix routes to the offline ONNX engine; `fal-ai/patina` routes to its height output.
     pub fn models(self) -> Vec<String> {
         match self {
+            DepthMode::Patina => vec![Self::PATINA.into()],
             DepthMode::Blend => vec![Self::DEPTH_ANYTHING.into(), Self::MARIGOLD.into()],
             DepthMode::Marigold => vec![Self::MARIGOLD.into()],
             DepthMode::DepthAnything => vec![Self::DEPTH_ANYTHING.into()],
@@ -156,7 +162,8 @@ impl DepthMode {
     /// UI label.
     pub fn label(self) -> &'static str {
         match self {
-            DepthMode::Blend => "Blend (both)",
+            DepthMode::Patina => "PATINA (texture)",
+            DepthMode::Blend => "Blend (scene depth)",
             DepthMode::Marigold => "Marigold",
             DepthMode::DepthAnything => "Depth Anything",
             DepthMode::Local => "Local (ONNX)",
@@ -170,16 +177,18 @@ impl DepthMode {
             DepthMode::Marigold => 1,
             DepthMode::DepthAnything => 2,
             DepthMode::Local => 3,
+            DepthMode::Patina => 4,
         }
     }
 
-    /// Inverse of [`Self::to_u8`]; unknown values fall back to `Blend`.
+    /// Inverse of [`Self::to_u8`]; unknown values fall back to `Patina` (the default).
     pub fn from_u8(v: u8) -> Self {
         match v {
+            0 => DepthMode::Blend,
             1 => DepthMode::Marigold,
             2 => DepthMode::DepthAnything,
             3 => DepthMode::Local,
-            _ => DepthMode::Blend,
+            _ => DepthMode::Patina,
         }
     }
 }
@@ -219,7 +228,7 @@ impl MapState {
             bit_depth_16: crate::data::map_def(id).bits == 16,
             fidelity: 0.96,
             detail_routing: 10.0,
-            depth_mode: DepthMode::Blend,
+            depth_mode: DepthMode::Patina,
         }
     }
 

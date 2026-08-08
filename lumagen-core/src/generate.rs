@@ -81,8 +81,10 @@ pub struct DepthReconstruct {
 impl Default for DepthReconstruct {
     fn default() -> Self {
         Self {
-            // Depth Anything = robust global structure; Marigold = finer macro detail.
-            depth_models: vec!["fal-ai/image-preprocessors/depth-anything/v2".into(), "fal-ai/imageutils/marigold-depth".into()],
+            // PATINA's texture→PBR height is structure-aligned (tiles, seams) — unlike the
+            // scene-depth models, which read a flat albedo as soft blobs. Kept as the default;
+            // Marigold / Depth Anything remain selectable per material.
+            depth_models: vec!["fal-ai/patina".into()],
             // PATINA (texture→PBR) supplies the micro normal; `maps: ["normal"]` so it computes
             // only that. Cleared → local high-pass derivation instead.
             normal_model: "fal-ai/patina".into(),
@@ -955,13 +957,24 @@ async fn estimate_depth_field(
     // Downscale the reference to the endpoints' 2048² input cap; the decoded depth is resized
     // back up in `reconstruct_depth`'s macro pass.
     let (est_rgba, est_side) = cap_estimate_input(albedo, side);
+    // PATINA is a texture→PBR extractor: request only its HEIGHT map (aligned to the actual
+    // surface structure), read from the tagged `images[]` array. Scene-depth models (Marigold /
+    // Depth Anything) return a single top-level image.
+    let (extra, output) = if model.contains("patina") {
+        (
+            crate::providers::obj(&[("maps", serde_json::Value::Array(vec!["height".into()]))]),
+            crate::providers::EstimateOutput::MapType("height".into()),
+        )
+    } else {
+        (depth.depth_extra.clone(), crate::providers::EstimateOutput::Image)
+    };
     let req = crate::providers::EstimateRequest {
         map: MapId::Displacement,
         rgba: est_rgba,
         side: est_side,
         model: model.to_string(),
-        extra: depth.depth_extra.clone(),
-        output: crate::providers::EstimateOutput::Image,
+        extra,
+        output,
     };
     let progress: &crate::providers::ProgressFn = &|_p| {};
     let resp = call_with_retry(retries, cancel, || provider.estimate(&req, cancel.child_token(), progress)).await?;
