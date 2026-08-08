@@ -321,6 +321,25 @@ impl HeightField {
         Ok(out)
     }
 
+    /// Decode a grayscale PNG back into a field at its native side, values **as stored**
+    /// (`0..1`, NOT renormalized) — the inverse of [`Self::to_png16_bytes`] for document reload,
+    /// preserving 16-bit precision via `to_luma16`. `None` if the bytes aren't a decodable image.
+    pub fn from_png_bytes(bytes: &[u8]) -> Option<Self> {
+        let img = image::load_from_memory(bytes).ok()?;
+        let side = img.width().min(img.height()) as usize;
+        if side == 0 {
+            return None;
+        }
+        let square = if img.width() == img.height() {
+            img
+        } else {
+            img.resize_exact(side as u32, side as u32, image::imageops::FilterType::Lanczos3)
+        };
+        let luma = square.to_luma16();
+        let data: Vec<f32> = luma.as_raw().iter().map(|&v| v as f32 / 65535.0).collect();
+        Self::from_vec(data, side)
+    }
+
     /// Write a 32-bit-float grayscale EXR (the default displacement format — the precision
     /// Blender's adaptive displacement and a clean normal/AO derivation want). The three RGB
     /// channels carry the same height so any DCC reads it as luminance.

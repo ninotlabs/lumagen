@@ -132,6 +132,15 @@ pub struct Document {
     pub negative_prompt: String,
     /// Per-map template overrides.
     pub map_templates: HashMap<String, String>,
+    /// The depth-reconstructed displacement height master, stored as a true 16-bit PNG so the
+    /// high-precision displacement survives save/load — the 8-bit RGBA master in `maps` can't
+    /// carry it. Empty when the displacement wasn't depth-reconstructed (derived-on-demand at
+    /// export instead). Its square side is `displacement_height_side`.
+    #[serde(default, with = "serde_bytes")]
+    pub displacement_height_png16: Vec<u8>,
+    /// Side length of `displacement_height_png16` (0 when absent).
+    #[serde(default)]
+    pub displacement_height_side: usize,
 }
 
 impl Default for Document {
@@ -153,6 +162,8 @@ impl Default for Document {
             final_requirement: String::new(),
             negative_prompt: String::new(),
             map_templates: HashMap::new(),
+            displacement_height_png16: Vec::new(),
+            displacement_height_side: 0,
         }
     }
 }
@@ -271,6 +282,23 @@ impl Document {
             )));
         }
         Ok(doc)
+    }
+
+    /// Store the depth-reconstructed displacement height master as a 16-bit PNG section, so a
+    /// TRUE 16-bit/EXR displacement survives save/load.
+    pub fn set_displacement_height(&mut self, height: &crate::height::HeightField) -> Result<()> {
+        self.displacement_height_png16 = height.to_png16_bytes()?;
+        self.displacement_height_side = height.side();
+        Ok(())
+    }
+
+    /// Read back the stored displacement height master, if any (decoded 16-bit-precise, values
+    /// as stored). `None` when the document carries no reconstructed height.
+    pub fn displacement_height(&self) -> Option<crate::height::HeightField> {
+        if self.displacement_height_png16.is_empty() {
+            return None;
+        }
+        crate::height::HeightField::from_png_bytes(&self.displacement_height_png16)
     }
 
     /// Serialize to pretty JSON (for diff/VCS export).
@@ -519,6 +547,31 @@ mod tests {
         // The AI-path flag and version history metadata survive the round-trip.
         assert!(mapdoc.ai_path, "ai_path not persisted");
         assert_eq!(mapdoc.version_seeds, vec![111, 222, 333], "version seeds not persisted");
+    }
+
+    /// The depth-reconstructed displacement height survives save/load at 16-bit precision, so a
+    /// reopened material still exports a TRUE 16-bit/EXR displacement.
+    #[test]
+    fn displacement_height_round_trips_at_16bit() {
+        let side = 64;
+        let n = (side * side) as f32;
+        let data: Vec<f32> = (0..side * side).map(|i| i as f32 / (n - 1.0)).collect();
+        let hf = crate::height::HeightField::from_vec(data, side).expect("square");
+
+        let mut doc = Document::default();
+        doc.set_displacement_height(&hf).expect("set height");
+        let dir = TestDir::new("disp_height");
+        let path = dir.path().join("h.lumagen");
+        doc.save(&path).expect("save");
+
+        let loaded = Document::load(&path).expect("load");
+        let back = loaded.displacement_height().expect("height restored");
+        assert_eq!(back.side(), side);
+        for (a, b) in hf.samples().iter().zip(back.samples()) {
+            assert!((a - b).abs() < 2.0 / 65535.0, "16-bit precision preserved: {a} vs {b}");
+        }
+        // A document with no reconstructed height reports none.
+        assert!(Document::default().displacement_height().is_none());
     }
 
     #[test]

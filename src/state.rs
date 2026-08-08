@@ -1397,6 +1397,7 @@ impl AppState {
                 path: path.clone(),
                 doc,
                 maps,
+                displacement_height: self.master_height.get(&MapId::Displacement).cloned(),
                 announce,
             })),
         );
@@ -2942,6 +2943,11 @@ impl AppState {
         }
         self.layout = maps::build_layout(self.seed);
         self.reset_maps_and_stores();
+        // Restore the reconstructed displacement height (16-bit section) so a reopened material
+        // still exports a TRUE 16-bit/EXR displacement instead of falling back to 8-bit/re-derive.
+        if let Some(hf) = doc.displacement_height() {
+            self.master_height.insert(MapId::Displacement, hf);
+        }
         let fallback_seed = self.seed;
         for id in MapId::ALL {
             // Maps the document never touched keep the default-policy path.
