@@ -496,10 +496,25 @@ pub fn brand_logo(ui: &mut Ui, size: f32) -> egui::Response {
 
 pub fn paint_checkerboard(painter: &egui::Painter, rect: Rect, cell: f32) {
     painter.rect_filled(rect, 0.0, CHECKER_B);
-    let cols = (rect.width() / cell).ceil() as i32 + 1;
-    let rows = (rect.height() / cell).ceil() as i32 + 1;
-    for r in 0..rows {
-        for c in 0..cols {
+    if cell <= 0.0 {
+        return;
+    }
+    // Only tessellate cells that fall inside the painter's clip region. A background drawn over
+    // a very large rect (a native-resolution or zoomed image) would otherwise emit one rect per
+    // cell across the whole area — millions of rects that overflow egui's per-frame index buffer
+    // and hard-crash the wgpu backend. The base fill above already covers the full rect, so the
+    // clipped cells are all that's ever visible. Indices stay aligned to `rect`'s origin so the
+    // pattern doesn't swim as the clip changes.
+    let vis = rect.intersect(painter.clip_rect());
+    if !vis.is_positive() {
+        return;
+    }
+    let col0 = (((vis.min.x - rect.min.x) / cell).floor() as i32).max(0);
+    let row0 = (((vis.min.y - rect.min.y) / cell).floor() as i32).max(0);
+    let col1 = ((vis.max.x - rect.min.x) / cell).ceil() as i32 + 1;
+    let row1 = ((vis.max.y - rect.min.y) / cell).ceil() as i32 + 1;
+    for r in row0..row1 {
+        for c in col0..col1 {
             if (r + c) % 2 == 0 {
                 let rct = Rect::from_min_size(rect.min + Vec2::new(c as f32 * cell, r as f32 * cell), Vec2::splat(cell)).intersect(rect);
                 painter.rect_filled(rct, 0.0, CHECKER_A);
