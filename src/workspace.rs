@@ -65,11 +65,13 @@ fn top_bar(ui: &mut Ui, state: &mut AppState) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(12.0);
                     if widgets::primary_button(ui, &format!("{}  Export", crate::icon::EXPORT)).clicked() {
-                        if state.generated_all() && state.has_map(MapId::Albedo) {
+                        // The albedo is the only required anchor; export writes whatever maps
+                        // exist (a simple texture needn't have the full set) and skips the rest.
+                        if state.has_map(MapId::Albedo) {
                             state.active_step = 3;
                             state.show_export = true;
                         } else {
-                            state.toast("Generate the maps first", ToastKind::Cost);
+                            state.toast("Generate an albedo first", ToastKind::Cost);
                         }
                     }
                     ui.add_space(8.0);
@@ -117,11 +119,11 @@ fn top_bar(ui: &mut Ui, state: &mut AppState) {
                                     }
                                 }
                                 _ => {
-                                    if state.generated_all() && state.has_map(MapId::Albedo) {
+                                    if state.has_map(MapId::Albedo) {
                                         state.active_step = 3;
                                         state.show_export = true;
                                     } else {
-                                        state.toast("Generate the maps first", ToastKind::Cost);
+                                        state.toast("Generate an albedo first", ToastKind::Cost);
                                     }
                                 }
                             }

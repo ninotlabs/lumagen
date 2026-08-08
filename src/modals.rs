@@ -993,6 +993,10 @@ fn variations(ctx: &egui::Context, state: &mut AppState) {
 fn export_modal(ctx: &egui::Context, state: &mut AppState) {
     // Kick off decodes for still-encoded masters; masters_decoding_hold gates the footer.
     state.ensure_masters_decoded(ctx);
+    // Export writes whatever maps exist — a simple texture needn't have the full set.
+    let present_maps: Vec<MapId> = MapId::ALL.iter().copied().filter(|id| state.has_map(*id)).collect();
+    let present = present_maps.len();
+    let plural = if present == 1 { "" } else { "s" };
     let mut close = false;
     let mut confirmed = false;
     let dismissed = scrim(ctx, "export", 560.0, |ui| {
@@ -1074,13 +1078,15 @@ fn export_modal(ctx: &egui::Context, state: &mut AppState) {
             ui.add_space(6.0);
             let preview_res = state.export_res_short().to_lowercase();
             let preview_material = state.material_name.clone();
-            let names_preview: Vec<String> = ["albedo", "roughness", "metallic", "normal"]
+            let names_preview: Vec<String> = present_maps
                 .iter()
-                .map(|k| {
+                .take(4)
+                .map(|id| {
+                    let slug = map_def(*id).name.to_lowercase().replace(' ', "_");
                     state
                         .export_pattern
                         .replace("$material", &preview_material)
-                        .replace("$map", k)
+                        .replace("$map", &slug)
                         .replace("$res", &preview_res)
                         + ".png"
                 })
@@ -1095,8 +1101,10 @@ fn export_modal(ctx: &egui::Context, state: &mut AppState) {
                     for n in &names_preview {
                         ui.label(RichText::new(n).monospace().size(11.5).color(accent()));
                     }
+                    let extra = present.saturating_sub(names_preview.len());
+                    let more = if extra > 0 { format!("…+{extra} more · ") } else { String::new() };
                     ui.label(
-                        RichText::new("…+4 more · contact_sheet.png · manifest.json")
+                        RichText::new(format!("{more}contact_sheet.png · manifest.json"))
                             .monospace()
                             .size(11.0)
                             .color(TEXT_LO),
@@ -1104,9 +1112,15 @@ fn export_modal(ctx: &egui::Context, state: &mut AppState) {
                 });
         });
         modal_footer(ui, |ui| {
-            ui.label(RichText::new("8 files + contact sheet · manifest.json · README.md").size(12.0).color(TEXT_MID));
+            ui.label(
+                RichText::new(format!("{present} map file{plural} · contact sheet · manifest.json · README.md"))
+                    .size(12.0)
+                    .color(TEXT_MID),
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if !masters_decoding_hold(ui, state) && widgets::primary_button(ui, &format!("{} Export 8 maps", crate::icon::DOWNLOAD)).clicked() {
+                if !masters_decoding_hold(ui, state)
+                    && widgets::primary_button(ui, &format!("{} Export {present} map{plural}", crate::icon::DOWNLOAD)).clicked()
+                {
                     confirmed = true;
                 }
             });
