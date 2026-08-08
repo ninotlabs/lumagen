@@ -68,6 +68,36 @@ pub(crate) fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
     url.strip_prefix("data:")?.split_once(";base64,")
 }
 
+/// Sanitize an upstream error body for display/logging. fal's 4xx responses **echo the input
+/// image** (`"input":"data:image/png;base64,<megabytes>"`), so a raw error can be many MB — and
+/// rendering it in the UI makes egui tessellate tens of millions of glyph quads, overflowing its
+/// index buffer and hard-crashing the wgpu backend. Cut any base64 payload down to a marker,
+/// then cap the length so no error string can ever reach the UI oversized.
+pub(crate) fn sanitize_error_body(body: &str) -> String {
+    const CAP: usize = 600;
+    // Replace each inline base64 payload (`;base64,<run>`) with a short marker.
+    let mut cleaned = String::with_capacity(body.len().min(2048));
+    let mut rest = body;
+    while let Some(pos) = rest.find(";base64,") {
+        let start = pos + ";base64,".len();
+        cleaned.push_str(&rest[..start]);
+        cleaned.push_str("<truncated>");
+        // The base64 run ends at the next quote/brace/bracket (JSON) or the end.
+        let end = rest[start..].find(['"', '}', ']']).map_or(rest.len(), |q| start + q);
+        rest = &rest[end..];
+    }
+    cleaned.push_str(rest);
+    // Cap the total length at a char boundary.
+    match cleaned.char_indices().nth(CAP) {
+        Some((cut, _)) => {
+            let mut s = cleaned[..cut].to_string();
+            s.push('…');
+            s
+        }
+        None => cleaned,
+    }
+}
+
 /// A text-only chat completion against any OpenAI-compatible endpoint (OpenAI, OpenRouter, a
 /// local Ollama server, …). Used by the optional LLM-powered Material Description Check to
 /// improve a material description. Returns the assistant's message text.
@@ -493,7 +523,7 @@ impl ImageData {
                 if !status.is_success() {
                     return Err(ProviderError::Api {
                         status: status.as_u16(),
-                        message: resp.text().await.unwrap_or_default(),
+                        message: sanitize_error_body(&resp.text().await.unwrap_or_default()),
                         kind: None,
                     });
                 }
@@ -802,6 +832,22 @@ mod tests {
             assert_eq!(bytes, b"not-really-png");
             assert_eq!(mime, "application/json", "mime comes from the content-type header");
         }
+    }
+
+    /// A fal 4xx body echoes the multi-MB base64 input image; sanitizing must strip the payload
+    /// and cap the length, while keeping the useful message and passing short bodies through —
+    /// so a megabyte error can never reach the UI and overflow egui's index buffer.
+    #[test]
+    fn sanitize_error_body_strips_base64_and_caps_length() {
+        let huge = "A".repeat(2_000_000);
+        let body = format!(r#"{{"detail":[{{"msg":"Image dimensions are too large. Maximum 2048x2048","input":"data:image/png;base64,{huge}"}}]}}"#);
+        let out = super::sanitize_error_body(&body);
+        assert!(out.chars().count() <= 601, "must be capped, got {}", out.chars().count());
+        assert!(out.contains("too large"), "keeps the useful message");
+        assert!(out.contains("<truncated>"), "base64 payload replaced with a marker");
+        assert!(!out.contains(&"A".repeat(1000)), "no long base64 run survives");
+        // A short, base64-free body passes through unchanged.
+        assert_eq!(super::sanitize_error_body("invalid API key"), "invalid API key");
     }
 
     /// The shared download client builds once and is reusable.

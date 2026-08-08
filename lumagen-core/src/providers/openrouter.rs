@@ -190,7 +190,7 @@ impl ImageProvider for OpenRouterProvider {
             let text = resp.text().await.unwrap_or_default();
             return Err(ProviderError::Api {
                 status,
-                message: text,
+                message: super::sanitize_error_body(&text),
                 kind: None,
             });
         }

@@ -285,8 +285,10 @@ impl FalProvider {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
         ProviderError::Api {
+            // fal's 4xx bodies echo the (multi-MB base64) input image — sanitize before it
+            // becomes a user-facing string, or the UI tries to render megabytes of text.
+            message: super::sanitize_error_body(&text),
             status,
-            message: text,
             kind: None,
         }
     }

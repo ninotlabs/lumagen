@@ -998,6 +998,16 @@ impl AppState {
     }
 
     pub fn toast(&mut self, msg: impl Into<String>, kind: ToastKind) {
+        // Cap the length. A provider/API error can echo a multi-megabyte base64 data URI (fal's
+        // 422 mirrors the input image), and a toast that long makes egui tessellate tens of
+        // millions of glyph quads — overflowing its per-frame index buffer and hard-crashing the
+        // wgpu backend. No toast needs more than a couple of lines.
+        const MAX_TOAST_CHARS: usize = 300;
+        let mut msg: String = msg.into();
+        if let Some((cut, _)) = msg.char_indices().nth(MAX_TOAST_CHARS) {
+            msg.truncate(cut);
+            msg.push('…');
+        }
         self.toasts.push(msg, kind);
     }
 
