@@ -902,6 +902,22 @@ async fn reconstruct_depth(
     .await
 }
 
+/// fal's estimator endpoints (PATINA, and the depth models) reject inputs larger than
+/// 2048×2048 (`image_too_large`). The albedo master can exceed that (gpt-image 2880², Topaz
+/// upscales), so the reference sent to a hosted estimator is downscaled to fit; the estimated
+/// map is resized back up on decode. Macro depth is low-frequency, so the cap costs it nothing.
+const MAX_ESTIMATE_SIDE: usize = 2048;
+
+/// Downscale an albedo to at most [`MAX_ESTIMATE_SIDE`] for a hosted estimator request,
+/// returning `(rgba, side)` — unchanged when already within the cap.
+fn cap_estimate_input(albedo: &[u8], side: usize) -> (Vec<u8>, usize) {
+    if side <= MAX_ESTIMATE_SIDE {
+        (albedo.to_vec(), side)
+    } else {
+        (crate::maps::resize_square_rgba(albedo, side, MAX_ESTIMATE_SIDE), MAX_ESTIMATE_SIDE)
+    }
+}
+
 /// Produce one depth field from a single model slug: the offline `local:` engine (Depth
 /// Anything V2 via ONNX, true raw float) when the slug is prefixed `local:`, else the hosted
 /// estimator (Marigold / Depth Anything) decoded from its 8-bit PNG.
@@ -936,10 +952,13 @@ async fn estimate_depth_field(
             ));
         }
     }
+    // Downscale the reference to the endpoints' 2048² input cap; the decoded depth is resized
+    // back up in `reconstruct_depth`'s macro pass.
+    let (est_rgba, est_side) = cap_estimate_input(albedo, side);
     let req = crate::providers::EstimateRequest {
         map: MapId::Displacement,
-        rgba: albedo.to_vec(),
-        side,
+        rgba: est_rgba,
+        side: est_side,
         model: model.to_string(),
         extra: depth.depth_extra.clone(),
         output: crate::providers::EstimateOutput::Image,
@@ -967,10 +986,13 @@ async fn reconstruct_micro_normal(
         let albedo = albedo.to_vec();
         decode_blocking(move || Ok(derive::derive_map(MapId::Normal, &albedo, None, side, &DeriveParams::default()))).await?
     } else {
+        // Downscale the reference to the endpoint's 2048² input cap (PATINA rejects larger);
+        // the returned normal is resized back up to the native `side` on decode.
+        let (est_rgba, est_side) = cap_estimate_input(albedo, side);
         let req = crate::providers::EstimateRequest {
             map: MapId::Normal,
-            rgba: albedo.to_vec(),
-            side,
+            rgba: est_rgba,
+            side: est_side,
             model: depth.normal_model.clone(),
             extra: depth.normal_extra.clone(),
             output: depth.normal_output.clone(),
@@ -998,6 +1020,20 @@ mod tests {
     use super::*;
     use crate::providers::MockProvider;
     use std::sync::Arc;
+
+    /// The estimator input is downscaled to fal's 2048² ceiling (PATINA / the depth models
+    /// reject larger inputs with `image_too_large`), and passes through unchanged within it.
+    #[test]
+    fn cap_estimate_input_respects_the_2048_ceiling() {
+        let big = vec![128u8; 2880 * 2880 * 4];
+        let (rgba, side) = cap_estimate_input(&big, 2880);
+        assert_eq!(side, MAX_ESTIMATE_SIDE, "oversized master is capped");
+        assert_eq!(rgba.len(), MAX_ESTIMATE_SIDE * MAX_ESTIMATE_SIDE * 4, "buffer matches the capped side");
+        let small = vec![64u8; 1024 * 1024 * 4];
+        let (rgba, side) = cap_estimate_input(&small, 1024);
+        assert_eq!(side, 1024, "within the cap, side is unchanged");
+        assert_eq!(rgba.len(), 1024 * 1024 * 4);
+    }
 
     /// Timeout means an ACCEPTED job hit its deadline — it may still run (and bill)
     /// server-side, so a retry would submit a duplicate paid job. Never resubmit on it.
