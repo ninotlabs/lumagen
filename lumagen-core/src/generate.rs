@@ -61,6 +61,9 @@ pub struct DepthReconstruct {
     /// Extra params for the normal request (PATINA's `maps: ["normal"]` so it computes only the
     /// normal). `Null` sends none.
     pub normal_extra: serde_json::Value,
+    /// Path to a local Depth Anything V2 ONNX model for the offline `local:` depth engine
+    /// (requires the `onnx` build feature). `None` → the `local:` model errors with guidance.
+    pub local_model_path: Option<std::path::PathBuf>,
     /// Invert the depth near/far convention.
     pub invert: bool,
     /// Best-of-both blend crossover as a FRACTION of side (resolution-independent) — the band
@@ -88,6 +91,7 @@ impl Default for DepthReconstruct {
             normal_model: "fal-ai/patina".into(),
             normal_output: crate::providers::EstimateOutput::MapType("normal".into()),
             normal_extra: crate::providers::obj(&[("maps", serde_json::Value::Array(vec!["normal".into()]))]),
+            local_model_path: None,
             invert: false,
             blend_radius: 0.02,
             crossover_radius: 0.01,
@@ -888,21 +892,7 @@ async fn reconstruct_depth(
 ) -> Result<HeightField, crate::providers::ProviderError> {
     let mut fields: Vec<HeightField> = Vec::with_capacity(depth.depth_models.len());
     for model in &depth.depth_models {
-        let req = crate::providers::EstimateRequest {
-            map: MapId::Displacement,
-            rgba: albedo.to_vec(),
-            side,
-            model: model.clone(),
-            extra: depth.depth_extra.clone(),
-            output: crate::providers::EstimateOutput::Image,
-        };
-        let progress: &crate::providers::ProgressFn = &|_p| {};
-        let resp = call_with_retry(retries, &cancel, || provider.estimate(&req, cancel.child_token(), progress)).await?;
-        let img = resp.images.into_iter().next().ok_or(crate::providers::ProviderError::Empty)?;
-        let bytes = image_bytes(img).await?;
-        let invert = depth.invert;
-        let hf = decode_blocking(move || crate::depth::decode_depth(&bytes, invert).ok_or(crate::providers::ProviderError::Empty)).await?;
-        fields.push(hf);
+        fields.push(estimate_depth_field(provider, model, albedo, side, depth, retries, &cancel).await?);
     }
     let blend_r = ((side as f32 * depth.blend_radius).round() as usize).max(1);
     let cross_r = ((side as f32 * depth.crossover_radius).round() as usize).max(1);
@@ -915,6 +905,56 @@ async fn reconstruct_depth(
         Ok(crate::depth::to_macro(&combined, cross_r))
     })
     .await
+}
+
+/// Produce one depth field from a single model slug: the offline `local:` engine (Depth
+/// Anything V2 via ONNX, true raw float) when the slug is prefixed `local:`, else the hosted
+/// estimator (Marigold / Depth Anything) decoded from its 8-bit PNG.
+async fn estimate_depth_field(
+    provider: &dyn ImageProvider,
+    model: &str,
+    albedo: &[u8],
+    side: usize,
+    depth: &DepthReconstruct,
+    retries: usize,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<HeightField, crate::providers::ProviderError> {
+    // `local:` routes to the offline ONNX engine (true raw float) instead of a provider.
+    if model.starts_with("local:") {
+        let Some(path) = depth.local_model_path.clone() else {
+            return Err(crate::providers::ProviderError::Job(
+                "local depth selected but no model path is configured (place a Depth Anything V2 ONNX in the cache)".into(),
+            ));
+        };
+        let invert = depth.invert;
+        let albedo = albedo.to_vec();
+        #[cfg(feature = "onnx")]
+        {
+            return decode_blocking(move || crate::onnx::reconstruct_local_depth(&path, &albedo, side, invert)).await;
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            // Keep the bindings live so the non-feature build has no unused-variable warnings.
+            let _ = (&path, invert, albedo.len(), side);
+            return Err(crate::providers::ProviderError::Job(
+                "local depth requires building Lumagen with the `onnx` feature (pure-Rust tract inference)".into(),
+            ));
+        }
+    }
+    let req = crate::providers::EstimateRequest {
+        map: MapId::Displacement,
+        rgba: albedo.to_vec(),
+        side,
+        model: model.to_string(),
+        extra: depth.depth_extra.clone(),
+        output: crate::providers::EstimateOutput::Image,
+    };
+    let progress: &crate::providers::ProgressFn = &|_p| {};
+    let resp = call_with_retry(retries, cancel, || provider.estimate(&req, cancel.child_token(), progress)).await?;
+    let img = resp.images.into_iter().next().ok_or(crate::providers::ProviderError::Empty)?;
+    let bytes = image_bytes(img).await?;
+    let invert = depth.invert;
+    decode_blocking(move || crate::depth::decode_depth(&bytes, invert).ok_or(crate::providers::ProviderError::Empty)).await
 }
 
 /// Reconstruct the MICRO normal from the albedo: estimate a surface normal via the configured

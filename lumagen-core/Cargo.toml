@@ -43,6 +43,14 @@ base64 = "0.23"
 fast_image_resize = "6"
 exr = "1.74"
 directories = "6"
+# Optional: pure-Rust ONNX inference for the local Depth Anything V2 depth engine (feature
+# `onnx`). No native runtime to link/download — keeps the default build untouched.
+tract-onnx = { version = "0.21", optional = true }
+
+[features]
+# Local (offline) Depth Anything V2 depth via tract. Off by default: the hosted Marigold /
+# Depth Anything path needs no extra deps; enabling this pulls the tract inference stack.
+onnx = ["dep:tract-onnx"]
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }

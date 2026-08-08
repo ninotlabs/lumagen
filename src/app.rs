@@ -208,6 +208,9 @@ impl LumagenApp {
             depth_models: disp.depth_mode.models(),
             invert: disp.invert,
             crossover_radius: 0.004 + (disp.detail_routing / 100.0).clamp(0.0, 1.0) * 0.03,
+            // The local ONNX engine (Depth Anything V2) reads its model from the app cache dir;
+            // only used when the depth model is "Local (ONNX)" and Lumagen is built with `onnx`.
+            local_model_path: directories::ProjectDirs::from("dev", "lumagen", "lumagen").map(|d| d.cache_dir().join("depth-anything-v2.onnx")),
             ..DepthReconstruct::default()
         };
         let plan = GenerationPlan {

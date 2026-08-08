@@ -126,24 +126,30 @@ pub struct Version {
 /// structure + finer macro detail).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DepthMode {
-    /// Run both models, blended best-of-both.
+    /// Run both hosted models, blended best-of-both.
     Blend,
     /// Marigold only (diffusion; finest macro detail).
     Marigold,
     /// Depth Anything V2 only (robust, fast).
     DepthAnything,
+    /// Local Depth Anything V2 via ONNX — offline, true raw float (needs the `onnx` build
+    /// feature + a local model).
+    Local,
 }
 
 impl DepthMode {
     const MARIGOLD: &'static str = "fal-ai/imageutils/marigold-depth";
     const DEPTH_ANYTHING: &'static str = "fal-ai/image-preprocessors/depth-anything/v2";
+    const LOCAL: &'static str = "local:depth-anything-v2";
 
-    /// The estimator slugs this mode drives, as `[global, detail]` for the blend.
+    /// The estimator slugs this mode drives, as `[global, detail]` for the blend. The `local:`
+    /// prefix routes to the offline ONNX engine instead of a provider.
     pub fn models(self) -> Vec<String> {
         match self {
             DepthMode::Blend => vec![Self::DEPTH_ANYTHING.into(), Self::MARIGOLD.into()],
             DepthMode::Marigold => vec![Self::MARIGOLD.into()],
             DepthMode::DepthAnything => vec![Self::DEPTH_ANYTHING.into()],
+            DepthMode::Local => vec![Self::LOCAL.into()],
         }
     }
 
@@ -153,6 +159,7 @@ impl DepthMode {
             DepthMode::Blend => "Blend (both)",
             DepthMode::Marigold => "Marigold",
             DepthMode::DepthAnything => "Depth Anything",
+            DepthMode::Local => "Local (ONNX)",
         }
     }
 
@@ -162,6 +169,7 @@ impl DepthMode {
             DepthMode::Blend => 0,
             DepthMode::Marigold => 1,
             DepthMode::DepthAnything => 2,
+            DepthMode::Local => 3,
         }
     }
 
@@ -170,6 +178,7 @@ impl DepthMode {
         match v {
             1 => DepthMode::Marigold,
             2 => DepthMode::DepthAnything,
+            3 => DepthMode::Local,
             _ => DepthMode::Blend,
         }
     }

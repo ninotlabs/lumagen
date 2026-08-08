@@ -1420,7 +1420,7 @@ fn depth_model_combo(ui: &mut Ui, state: &mut AppState) {
     let resp = egui::ComboBox::from_id_salt("depth_model")
         .selected_text(mode.label())
         .show_ui(ui, |ui| {
-            for m in [DepthMode::Blend, DepthMode::Marigold, DepthMode::DepthAnything] {
+            for m in [DepthMode::Blend, DepthMode::Marigold, DepthMode::DepthAnything, DepthMode::Local] {
                 ui.selectable_value(&mut mode, m, m.label());
             }
         });
