@@ -74,6 +74,10 @@ pub struct MapDoc {
     /// the full master decode and gain previews on their next save).
     #[serde(default, with = "serde_bytes")]
     pub preview_png: Vec<u8>,
+    /// Depth-model selection for an AI-path displacement (0 = Blend both, 1 = Marigold,
+    /// 2 = Depth Anything). Displacement only; ignored for other maps.
+    #[serde(default)]
+    pub depth_mode: u8,
 }
 
 impl Default for MapDoc {
@@ -94,6 +98,7 @@ impl Default for MapDoc {
             px_size: 0,
             png: Vec::new(),
             preview_png: Vec::new(),
+            depth_mode: 0,
         }
     }
 }
@@ -332,6 +337,8 @@ pub struct MapDocParams {
     pub ai_path: bool,
     /// The seed of each version in the history.
     pub version_seeds: Vec<u32>,
+    /// Depth-model selection for an AI-path displacement (see [`MapDoc::depth_mode`]).
+    pub depth_mode: u8,
 }
 
 impl MapDocParams {
@@ -355,6 +362,7 @@ impl MapDocParams {
             px_size,
             png,
             preview_png,
+            depth_mode: self.depth_mode,
         }
     }
 }

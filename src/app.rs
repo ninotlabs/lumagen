@@ -200,6 +200,16 @@ impl LumagenApp {
         let retries = self.retries();
         let paths = std::array::from_fn(|i| self.state.maps[i].derive_path);
         let derive_params = std::array::from_fn(|i| self.state.maps[i].derive_params());
+        // Depth-model reconstruction is configured from the displacement map's own controls:
+        // the depth-model picker, the Invert toggle, and the macro↔micro split slider (0..100
+        // → a ~0.4%..3.4%-of-side crossover — a larger split keeps the displacement broader).
+        let disp = &self.state.maps[MapId::Displacement.index()];
+        let depth = DepthReconstruct {
+            depth_models: disp.depth_mode.models(),
+            invert: disp.invert,
+            crossover_radius: 0.004 + (disp.detail_routing / 100.0).clamp(0.0, 1.0) * 0.03,
+            ..DepthReconstruct::default()
+        };
         let plan = GenerationPlan {
             paths,
             model,
@@ -208,8 +218,7 @@ impl LumagenApp {
             retries,
             size: Some(ImageSpec::Aspect("1:1".into())),
             derive_params,
-            // Depth-model reconstruction config; UI/settings wiring comes in the export/UI pass.
-            depth: DepthReconstruct::default(),
+            depth,
         };
         let (albedo, albedo_master) = self.albedo_reference();
         let size = crate::maps::TEX_SIZE;

@@ -121,6 +121,60 @@ pub struct Version {
     pub master: Option<(std::sync::Arc<Vec<u8>>, usize)>,
 }
 
+/// Which depth model(s) reconstruct the macro displacement when it's on the AI path. A
+/// per-material override; the default `Blend` runs both and keeps best-of-both (robust global
+/// structure + finer macro detail).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DepthMode {
+    /// Run both models, blended best-of-both.
+    Blend,
+    /// Marigold only (diffusion; finest macro detail).
+    Marigold,
+    /// Depth Anything V2 only (robust, fast).
+    DepthAnything,
+}
+
+impl DepthMode {
+    const MARIGOLD: &'static str = "fal-ai/imageutils/marigold-depth";
+    const DEPTH_ANYTHING: &'static str = "fal-ai/image-preprocessors/depth-anything/v2";
+
+    /// The estimator slugs this mode drives, as `[global, detail]` for the blend.
+    pub fn models(self) -> Vec<String> {
+        match self {
+            DepthMode::Blend => vec![Self::DEPTH_ANYTHING.into(), Self::MARIGOLD.into()],
+            DepthMode::Marigold => vec![Self::MARIGOLD.into()],
+            DepthMode::DepthAnything => vec![Self::DEPTH_ANYTHING.into()],
+        }
+    }
+
+    /// UI label.
+    pub fn label(self) -> &'static str {
+        match self {
+            DepthMode::Blend => "Blend (both)",
+            DepthMode::Marigold => "Marigold",
+            DepthMode::DepthAnything => "Depth Anything",
+        }
+    }
+
+    /// Stable persistence discriminant.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            DepthMode::Blend => 0,
+            DepthMode::Marigold => 1,
+            DepthMode::DepthAnything => 2,
+        }
+    }
+
+    /// Inverse of [`Self::to_u8`]; unknown values fall back to `Blend`.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => DepthMode::Marigold,
+            2 => DepthMode::DepthAnything,
+            _ => DepthMode::Blend,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MapState {
     pub status: MapStatus,
@@ -138,6 +192,8 @@ pub struct MapState {
     pub bit_depth_16: bool,
     pub fidelity: f32,
     pub detail_routing: f32, // macro ↔ micro split (10 = displacement owns 10%)
+    /// Which depth model(s) drive an AI-path displacement (Displacement only; ignored elsewhere).
+    pub depth_mode: DepthMode,
 }
 
 impl MapState {
@@ -154,6 +210,7 @@ impl MapState {
             bit_depth_16: crate::data::map_def(id).bits == 16,
             fidelity: 0.96,
             detail_routing: 10.0,
+            depth_mode: DepthMode::Blend,
         }
     }
 
@@ -1300,6 +1357,7 @@ impl AppState {
             locked: m.status == MapStatus::Locked,
             ai_path: m.derive_path == DerivePath::Ai,
             version_seeds: m.versions.iter().map(|v| v.seed).collect(),
+            depth_mode: m.depth_mode.to_u8(),
         }
     }
 
@@ -2965,6 +3023,7 @@ impl AppState {
                 m.bit_depth_16 = mapdoc.bit_depth_16;
                 m.fidelity = mapdoc.fidelity;
                 m.detail_routing = mapdoc.detail_routing;
+                m.depth_mode = DepthMode::from_u8(mapdoc.depth_mode);
                 m.active_version = mapdoc.active_version;
                 // The document's per-map path wins (the Path toggle persists per material);
                 // a never-generated map falls back to the default policy.

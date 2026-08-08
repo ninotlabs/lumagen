@@ -1325,12 +1325,35 @@ fn derived_map_props(ui: &mut Ui, ctx: &egui::Context, state: &mut AppState, id:
                 mark_adjust(state, ui, id);
             }
         });
+    } else if id == MapId::Displacement {
+        // The AI displacement is depth-model-reconstructed: its controls (depth model, near/far,
+        // bit depth, macro/micro split) drive the reconstruction and apply on the next
+        // Re-generate — they are not live re-derives.
+        section(ui, |ui| {
+            depth_model_combo(ui, state);
+            ui.add_space(6.0);
+            bit_depth_combo(ui, state, "bitdepth_ai");
+            ui.add_space(6.0);
+            let mut invert = state.map(id).invert;
+            if widgets::toggle_row(ui, &mut invert, "Invert depth (near ⇄ far)").changed() {
+                state.map_mut(id).invert = invert;
+            }
+            ui.add_space(8.0);
+            let mut split = state.map(id).detail_routing;
+            widgets::field_label(ui, "Macro / micro split", Some(&format!("{:.0} / {:.0}", split, 100.0 - split)));
+            if ui.add(egui::Slider::new(&mut split, 0.0..=100.0).show_value(false)).changed() {
+                state.map_mut(MapId::Displacement).detail_routing = split;
+                state.map_mut(MapId::Normal).detail_routing = split;
+            }
+            slider_legend(ui, "Displacement (macro)", "Normal (micro)");
+            ui.add_space(6.0);
+            widgets::derive_note(
+                ui,
+                "Depth reconstruction: the depth model estimates macro relief; the Normal map carries micro detail. These apply on the next Re-generate.",
+            );
+        });
     } else {
         section(ui, |ui| {
-            if id == MapId::Displacement {
-                bit_depth_combo(ui, state, "bitdepth_ai");
-                ui.add_space(6.0);
-            }
             widgets::derive_note(
                 ui,
                 "This map is on the AI path. Change it with Re-generate or 4 variations above — the adjust sliders apply to derived-path maps only.",
@@ -1385,6 +1408,25 @@ fn derived_map_props(ui: &mut Ui, ctx: &egui::Context, state: &mut AppState, id:
     });
 
     history_section(ui, ctx, state, id);
+}
+
+/// Depth-model picker for an AI-path displacement — drives `DepthReconstruct.depth_models`
+/// (Blend runs both models best-of-both; or force Marigold / Depth Anything). Applies on the
+/// next Re-generate.
+fn depth_model_combo(ui: &mut Ui, state: &mut AppState) {
+    use crate::state::DepthMode;
+    widgets::field_label(ui, "Depth model", None);
+    let mut mode = state.map(MapId::Displacement).depth_mode;
+    let resp = egui::ComboBox::from_id_salt("depth_model")
+        .selected_text(mode.label())
+        .show_ui(ui, |ui| {
+            for m in [DepthMode::Blend, DepthMode::Marigold, DepthMode::DepthAnything] {
+                ui.selectable_value(&mut mode, m, m.label());
+            }
+        });
+    if resp.response.changed() {
+        state.map_mut(MapId::Displacement).depth_mode = mode;
+    }
 }
 
 /// Displacement export bit depth. Only affects export precision — no live re-derive needed.
