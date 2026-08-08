@@ -8,6 +8,7 @@
 //! the macro↔micro `detail_routing` split) when height isn't AI-generated.
 
 use crate::data::MapId;
+use crate::height::HeightField;
 
 /// Which maps are derived (computed) vs. AI-generated (semantic), by default. The per-map
 /// AI⇄derived toggle in the UI can promote any map to a full AI generation.
@@ -144,10 +145,34 @@ pub fn height_from_albedo(albedo: &[u8], size: usize, params: &DeriveParams) -> 
     height
 }
 
-/// Displacement map (RGBA8) from a height field, honoring invert/strength. 16-bit export is
-/// handled separately at export time (`png` / EXR); the in-app map is 8-bit RGBA.
+/// Displacement map (RGBA8) from a height field, honoring invert/strength. This is the 8-bit
+/// preview/contact-sheet view; the export path carries the [`HeightField`] below so the file
+/// is quantized to 16-bit/EXR from full `f32` precision instead of this 256-level buffer.
 pub fn displacement_from_height(height: &[f32], size: usize, params: &DeriveParams) -> Vec<u8> {
     gray_to_rgba(height, size, params.invert, params.strength)
+}
+
+/// The displacement as a high-precision [`HeightField`] (0..1, `invert`/`strength` applied) —
+/// the `f32` analog of [`displacement_from_height`], kept in float so export quantizes to a
+/// true 16-bit PNG / 32-bit-float EXR exactly once instead of widening an 8-bit value by ×257.
+pub fn displacement_height_field(height: &[f32], size: usize, params: &DeriveParams) -> HeightField {
+    let mut data = vec![0.0f32; size * size];
+    for (out, &h) in data.iter_mut().zip(height) {
+        let mut v = h * params.strength;
+        if params.invert {
+            v = 1.0 - v;
+        }
+        *out = v.clamp(0.0, 1.0);
+    }
+    HeightField::from_vec(data, size).unwrap_or_else(|| HeightField::filled(size, 0.0))
+}
+
+/// Compute the displacement [`HeightField`] directly from the albedo (the derived path's
+/// source) — the same relief `derive_map(MapId::Displacement, …)` produces, but preserved in
+/// full `f32` precision for a genuine 16-bit/EXR export.
+pub fn displacement_height_field_from_albedo(albedo: &[u8], size: usize, params: &DeriveParams) -> HeightField {
+    let height = height_from_albedo(albedo, size, params);
+    displacement_height_field(&height, size, params)
 }
 
 // ── Normal from height (Sobel) ─────────────────────────────────────────────
@@ -186,6 +211,40 @@ pub fn normal_from_height(height: &[f32], size: usize, params: &DeriveParams) ->
             let b = ((nz * 0.5 + 0.5) * 255.0).round() as u8;
             pixels[i] = [r, g, b, 255];
         }
+    }
+    out
+}
+
+/// Strip the **macro** tilt from a tangent-space normal map, keeping only the **micro** detail
+/// — so a depth-driven displacement (which already carries the macro relief) and this normal
+/// don't double-count the same feature. The tangent XY are high-passed (full minus a blurred
+/// macro tilt at `radius`), Z is reconstructed, and the vector is renormalized to unit length.
+/// This is the reference pipeline's "normal deliberately OMITS macro displacement."
+pub fn high_pass_normal(normal: &[u8], size: usize, radius: usize) -> Vec<u8> {
+    let (px, _) = normal.as_chunks::<4>();
+    let mut nx = vec![0.0f32; size * size];
+    let mut ny = vec![0.0f32; size * size];
+    for (i, p) in px.iter().enumerate() {
+        nx[i] = p[0] as f32 / 127.5 - 1.0;
+        ny[i] = p[1] as f32 / 127.5 - 1.0;
+    }
+    // The macro tilt is the low-frequency part of the tangent slope; the micro detail is the
+    // residual after removing it.
+    let macro_x = blur_gray(&nx, size, radius);
+    let macro_y = blur_gray(&ny, size, radius);
+    let mut out = vec![0u8; size * size * 4];
+    for (i, p) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let mut mx = nx[i] - macro_x[i];
+        let mut my = ny[i] - macro_y[i];
+        let mut mz = 1.0f32;
+        let len = (mx * mx + my * my + mz * mz).sqrt().max(1e-6);
+        mx /= len;
+        my /= len;
+        mz /= len;
+        p[0] = ((mx * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+        p[1] = ((my * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+        p[2] = ((mz * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+        p[3] = 255;
     }
     out
 }
@@ -404,6 +463,24 @@ mod tests {
         }
         let dielectric = metallic_from_albedo(&painted, size, &params);
         assert!(dielectric[0] < 40, "saturated paint reads dielectric, got {}", dielectric[0]);
+    }
+
+    /// High-passing a normal removes its macro tilt (a constant slope bias), leaving the mean
+    /// tangent near neutral so it doesn't double-count the displacement's macro relief.
+    #[test]
+    fn high_pass_normal_strips_macro_tilt() {
+        let size = 16;
+        let mut normal = vec![0u8; size * size * 4];
+        for (i, p) in normal.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            // Strong constant macro tilt in +X (r ≈ 0.7·255) plus a tiny per-pixel micro wiggle.
+            let micro = if i % 2 == 0 { 3i16 } else { -3 };
+            let r = (0.7 * 255.0) as i16 + micro;
+            *p = [r.clamp(0, 255) as u8, 128, 200, 255];
+        }
+        let out = high_pass_normal(&normal, size, 4);
+        let sum_r: u32 = out.as_chunks::<4>().0.iter().map(|p| u32::from(p[0])).sum();
+        let avg_r = sum_r / (size * size) as u32;
+        assert!((avg_r as i32 - 128).abs() < 20, "macro tilt removed → mean nx ≈ neutral, got r={avg_r}");
     }
 
     #[test]

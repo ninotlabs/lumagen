@@ -572,6 +572,32 @@ pub struct UpscaleRequest {
     pub model: String,
 }
 
+/// A request to run a single-image **estimator/preprocessor** — depth (Marigold, Depth
+/// Anything) or surface normals — that takes one image and returns one image. Unlike
+/// [`ImageRequest`] (prompt-driven, returns an `images` array) and [`UpscaleRequest`] (Topaz
+/// factor), these fal endpoints take `{ image_url, … }` and return a single `image` File.
+///
+/// The depth path reconstructs the **macro** relief; a normals estimator reconstructs the
+/// **micro** detail. Both hosted fal endpoints return 8-bit PNG — genuine `f32` macro relief
+/// is recovered downstream by low-passing (averaging many 8-bit samples yields sub-LSB
+/// precision, and the quantized high frequencies are exactly what the macro pass discards).
+#[derive(Clone, Debug)]
+pub struct EstimateRequest {
+    /// Which map this estimation feeds (labeling/telemetry).
+    pub map: MapId,
+    /// Source RGBA8 pixels (square) — the albedo the estimator reads.
+    pub rgba: Vec<u8>,
+    /// Source side length.
+    pub side: usize,
+    /// The estimator endpoint id (e.g. `fal-ai/imageutils/marigold-depth`,
+    /// `fal-ai/image-preprocessors/depth-anything/v2`). Configurable per the same rule as
+    /// generation slugs — never hardcoded as the only option.
+    pub model: String,
+    /// Endpoint-specific params merged into the request body (Marigold's `ensemble_size`,
+    /// `num_inference_steps`, `processing_res`; `Null` sends none).
+    pub extra: serde_json::Value,
+}
+
 /// Estimated cost of one Topaz upscale by OUTPUT megapixels (fal's published tier table:
 /// $0.08 ≤ 24MP, $0.16 ≤ 48MP, $0.32 ≤ 96MP, up to $1.36 for 512MP).
 pub fn topaz_cost_estimate(target_side: usize) -> f64 {
@@ -603,6 +629,18 @@ pub trait ImageProvider: Send + Sync {
         _progress: &ProgressFn,
     ) -> Result<ImageResponse, ProviderError> {
         Err(ProviderError::Job("upscaling is not supported by this backend — fal.ai drives Topaz".into()))
+    }
+
+    /// Run a single-image estimator/preprocessor — depth (Marigold / Depth Anything) or
+    /// surface normals — that returns one image. fal submits to the endpoint queue; the mock
+    /// derives an offline stand-in from the albedo; backends without estimators error.
+    async fn estimate(
+        &self,
+        _req: &EstimateRequest,
+        _cancel: tokio_util::sync::CancellationToken,
+        _progress: &ProgressFn,
+    ) -> Result<ImageResponse, ProviderError> {
+        Err(ProviderError::Job("depth/normal estimation is not supported by this backend".into()))
     }
 
     /// Which backend this is.

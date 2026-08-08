@@ -5,8 +5,8 @@
 //! fal returns (`status_url`/`response_url`/`cancel_url`) so path changes don't break us.
 
 use super::{
-    BackendParams, ImageData, ImageProvider, ImageRequest, ImageResponse, ImageSpec, JobProgress, OutputImage, ProviderError, ProviderId, RequestKind,
-    UpscaleRequest,
+    BackendParams, EstimateRequest, ImageData, ImageProvider, ImageRequest, ImageResponse, ImageSpec, JobProgress, OutputImage, ProviderError, ProviderId,
+    RequestKind, UpscaleRequest,
 };
 
 const QUEUE_BASE: &str = "https://queue.fal.run";
@@ -438,6 +438,22 @@ impl FalProvider {
             ("crop_to_fill", false.into()),
         ]))
     }
+
+    /// Build an estimator body: the source as a PNG `image_url`, plus any endpoint-specific
+    /// params (Marigold's `ensemble_size`/`num_inference_steps`/`processing_res`) merged in.
+    fn build_estimate_body(req: &EstimateRequest) -> Option<serde_json::Value> {
+        use base64::Engine as _;
+        let png = crate::maps::encode_png_rgba(&req.rgba, req.side)?;
+        let data_uri = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png));
+        let mut body = serde_json::Map::new();
+        body.insert("image_url".into(), data_uri.into());
+        if let Some(extra) = req.extra.as_object() {
+            for (k, v) in extra {
+                body.insert(k.clone(), v.clone());
+            }
+        }
+        Some(serde_json::Value::Object(body))
+    }
 }
 
 #[async_trait::async_trait]
@@ -555,6 +571,49 @@ impl ImageProvider for FalProvider {
             }],
             seed: None,
             cost: Some(super::topaz_cost_estimate(req.target_side)),
+            raw,
+        })
+    }
+
+    /// Run a depth/normal estimator (`fal-ai/imageutils/marigold-depth`,
+    /// `fal-ai/image-preprocessors/depth-anything/v2`, a normals endpoint): submit the source
+    /// as a PNG data URI, poll the queue, download the single-file result — the same
+    /// single-`image` output shape as Topaz, not the `images` array `generate` returns.
+    #[tracing::instrument(skip(self, req, cancel, progress), fields(?req.map, model = %req.model, side = req.side))]
+    async fn estimate(
+        &self,
+        req: &EstimateRequest,
+        cancel: tokio_util::sync::CancellationToken,
+        progress: &super::ProgressFn,
+    ) -> Result<ImageResponse, ProviderError> {
+        let body = Self::build_estimate_body(req).ok_or_else(|| ProviderError::Job("could not encode source PNG".into()))?;
+        let url = format!("{}/{}", QUEUE_BASE, req.model);
+        let http = self.http()?;
+        progress(JobProgress::Submitted);
+        let submit = tokio::select! {
+            biased;
+            () = cancel.cancelled() => { return Err(ProviderError::Canceled); }
+            r = http.post(&url)
+                .header(reqwest::header::AUTHORIZATION, self.auth_value())
+                .json(&body)
+                .send() => { r? }
+        };
+        if !submit.status().is_success() {
+            return Err(Self::api_error(submit).await);
+        }
+        let sub: SubmitResponse = submit.json().await?;
+        let raw = self.poll_and_fetch(&sub, &cancel, progress).await?;
+        let file_url = raw.pointer("/image/url").and_then(|u| u.as_str()).ok_or(ProviderError::Empty)?.to_string();
+        progress(JobProgress::Done);
+        Ok(ImageResponse {
+            images: vec![OutputImage {
+                data: ImageData::Url(file_url),
+                width: raw.pointer("/image/width").and_then(|w| w.as_u64()).map(|w| w as u32),
+                height: raw.pointer("/image/height").and_then(|h| h.as_u64()).map(|h| h as u32),
+                content_type: raw.pointer("/image/content_type").and_then(|c| c.as_str()).map(str::to_string),
+            }],
+            seed: None,
+            cost: None,
             raw,
         })
     }
@@ -699,6 +758,26 @@ mod tests {
         let big = UpscaleRequest { target_side: 100, ..req };
         let body = FalProvider::build_upscale_body(&big).expect("body");
         assert_eq!(body.get("upscale_factor").and_then(|v| v.as_f64()), Some(4.0));
+    }
+
+    /// An estimator body carries the source as a PNG data URI and merges the endpoint's extra
+    /// params (Marigold's ensemble/steps) verbatim.
+    #[test]
+    fn estimate_body_carries_image_url_and_extra() {
+        let req = EstimateRequest {
+            map: crate::data::MapId::Displacement,
+            rgba: vec![90u8; 8 * 8 * 4],
+            side: 8,
+            model: "fal-ai/imageutils/marigold-depth".into(),
+            extra: crate::providers::obj(&[("ensemble_size", 10.into()), ("num_inference_steps", 12.into())]),
+        };
+        let body = FalProvider::build_estimate_body(&req).expect("body");
+        assert!(
+            body.get("image_url").and_then(|v| v.as_str()).is_some_and(|u| u.starts_with("data:image/png;base64,")),
+            "image_url must be a PNG data URI"
+        );
+        assert_eq!(body.get("ensemble_size").and_then(|v| v.as_i64()), Some(10));
+        assert_eq!(body.get("num_inference_steps").and_then(|v| v.as_i64()), Some(12));
     }
 
     /// The published cost tiers by output megapixels.

@@ -467,9 +467,18 @@ fn run_worker(rx: Receiver<Task>, tx: Sender<Output>, ctx: egui::Context) {
                 // detail into the export, off the UI thread.
                 if let Some((albedo, side)) = albedo_src {
                     for (id, params) in derive_missing {
-                        let rgba = lumagen_core::derive::derive_map(id, &albedo, None, side, &params);
-                        job.maps[id.index()] = Some(rgba);
-                        job.map_sizes[id.index()] = side;
+                        if id == MapId::Displacement {
+                            // Keep the displacement in full f32 so export writes a TRUE
+                            // 16-bit/EXR file; the 8-bit buffer is only for the contact sheet.
+                            let hf = lumagen_core::derive::displacement_height_field_from_albedo(&albedo, side, &params);
+                            job.maps[id.index()] = Some(hf.to_rgba8(false, 1.0, false));
+                            job.map_sizes[id.index()] = side;
+                            job.displacement_height = Some(hf);
+                        } else {
+                            let rgba = lumagen_core::derive::derive_map(id, &albedo, None, side, &params);
+                            job.maps[id.index()] = Some(rgba);
+                            job.map_sizes[id.index()] = side;
+                        }
                     }
                 }
                 let result = lumagen_core::export::export_material(&job, &dir)

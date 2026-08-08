@@ -1178,6 +1178,11 @@ fn run_export(ctx: &egui::Context, state: &mut AppState) {
         directx_normal,
         displacement_16bit_png: state.map(MapId::Displacement).bit_depth_16,
         displacement_exr,
+        // The f32 height master from the depth-model path exports as TRUE 16-bit/EXR. When the
+        // displacement is instead derived on demand, this is None here and the worker
+        // (render.rs) fills it from the albedo at native resolution (deriving the f32 height at
+        // 4K on the UI thread would freeze it).
+        displacement_height: state.master_height.get(&MapId::Displacement).cloned(),
         seed: state.seed,
         prompt: state.description.clone(),
         seam_margin: state.settings.seam_margin.trim().parse::<usize>().unwrap_or(64).min(out_size / 4),

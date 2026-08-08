@@ -190,7 +190,7 @@ impl LumagenApp {
     /// and streams finished maps back through the worker's generation channel.
     #[tracing::instrument(skip_all)]
     fn launch_generation(&mut self, ctx: &egui::Context) {
-        use lumagen_core::generate::{GenerationPlan, MapGenerator};
+        use lumagen_core::generate::{DepthReconstruct, GenerationPlan, MapGenerator};
         use lumagen_core::providers::ImageSpec;
 
         // Maps are image edits — use the edit-endpoint slug.
@@ -208,6 +208,8 @@ impl LumagenApp {
             retries,
             size: Some(ImageSpec::Aspect("1:1".into())),
             derive_params,
+            // Depth-model reconstruction config; UI/settings wiring comes in the export/UI pass.
+            depth: DepthReconstruct::default(),
         };
         let (albedo, albedo_master) = self.albedo_reference();
         let size = crate::maps::TEX_SIZE;

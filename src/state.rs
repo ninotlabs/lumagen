@@ -494,6 +494,10 @@ pub struct AppState {
     /// Pixels are `Arc`-shared (never mutated in place) so save/derive/version snapshots
     /// clone the handle, not the buffer.
     pub master_pixels: HashMap<MapId, (std::sync::Arc<Vec<u8>>, usize)>,
+    /// High-precision displacement height masters (`0..1` `f32`) from the depth-model macro
+    /// path, keyed by map (only Displacement uses it today). Parallel to `master_pixels`: the
+    /// 8-bit master drives the UI/contact sheet, this drives a TRUE 16-bit/EXR export.
+    pub master_height: HashMap<MapId, lumagen_core::height::HeightField>,
     /// GPU textures of the masters, uploaded on demand so the 2D viewport shows native
     /// resolution instead of the soft 400² working copy.
     pub master_textures: HashMap<MapId, TextureHandle>,
@@ -709,6 +713,7 @@ impl AppState {
             lib_previews: HashMap::new(),
             map_pixels: HashMap::new(),
             master_pixels: HashMap::new(),
+            master_height: HashMap::new(),
             master_textures: HashMap::new(),
             gen_size: 0,
             queue: Vec::new(),
@@ -912,6 +917,7 @@ impl AppState {
         self.thumbs.clear();
         self.map_pixels.clear();
         self.master_pixels.clear();
+        self.master_height.clear();
         self.master_encoded.clear();
         self.master_textures.clear();
     }
@@ -1684,7 +1690,7 @@ impl AppState {
     fn apply_generated(&mut self, ctx: &egui::Context, outcome: lumagen_core::generate::MapOutcome) {
         use lumagen_core::generate::MapOutcome;
         match outcome {
-            MapOutcome::Ready { map, rgba, master, cost } => {
+            MapOutcome::Ready { map, rgba, master, height, cost } => {
                 let was_upscale = self.upscaling.remove(&map);
                 // Only a generation result may retire generation state — an upscale finishing
                 // mid-regeneration must not clobber the regen's cancel token or progress.
@@ -1694,6 +1700,13 @@ impl AppState {
                 let px = std::sync::Arc::new(rgba);
                 self.install_pixels(ctx, map, std::sync::Arc::clone(&px));
                 self.set_master(map, master.map(|(mpx, side)| (std::sync::Arc::new(mpx), side)));
+                // Keep the f32 displacement master for a TRUE 16-bit/EXR export. A displacement
+                // result WITHOUT one (derived, upscaled, imported) supersedes any stale height.
+                if let Some(h) = height {
+                    self.master_height.insert(map, h);
+                } else if map == MapId::Displacement {
+                    self.master_height.remove(&map);
+                }
                 let seed = self.seed;
                 let master_arc = self.master_pixels.get(&map).cloned();
                 self.push_version(map, seed, Some(px), master_arc);

@@ -294,6 +294,7 @@ fn full_workflow_create_generate_save_scan_export() {
         directx_normal: false,
         displacement_16bit_png: true,
         displacement_exr: true,
+        displacement_height: None,
         seed: fresh.seed,
         prompt: fresh.description.clone(),
         seam_margin: 64,
