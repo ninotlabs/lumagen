@@ -190,7 +190,7 @@ impl LumagenApp {
     /// and streams finished maps back through the worker's generation channel.
     #[tracing::instrument(skip_all)]
     fn launch_generation(&mut self, ctx: &egui::Context) {
-        use lumagen_core::generate::{GenerationPlan, MapGenerator};
+        use lumagen_core::generate::{DepthReconstruct, GenerationPlan, MapGenerator};
         use lumagen_core::providers::ImageSpec;
 
         // Maps are image edits — use the edit-endpoint slug.
@@ -200,6 +200,19 @@ impl LumagenApp {
         let retries = self.retries();
         let paths = std::array::from_fn(|i| self.state.maps[i].derive_path);
         let derive_params = std::array::from_fn(|i| self.state.maps[i].derive_params());
+        // Depth-model reconstruction is configured from the displacement map's own controls:
+        // the depth-model picker, the Invert toggle, and the macro↔micro split slider (0..100
+        // → a ~0.4%..3.4%-of-side crossover — a larger split keeps the displacement broader).
+        let disp = &self.state.maps[MapId::Displacement.index()];
+        let depth = DepthReconstruct {
+            depth_models: disp.depth_mode.models(),
+            invert: disp.invert,
+            crossover_radius: 0.004 + (disp.detail_routing / 100.0).clamp(0.0, 1.0) * 0.03,
+            // The local ONNX engine (Depth Anything V2) reads its model from the app cache dir;
+            // only used when the depth model is "Local (ONNX)" and Lumagen is built with `onnx`.
+            local_model_path: directories::ProjectDirs::from("dev", "lumagen", "lumagen").map(|d| d.cache_dir().join("depth-anything-v2.onnx")),
+            ..DepthReconstruct::default()
+        };
         let plan = GenerationPlan {
             paths,
             model,
@@ -208,6 +221,7 @@ impl LumagenApp {
             retries,
             size: Some(ImageSpec::Aspect("1:1".into())),
             derive_params,
+            depth,
         };
         let (albedo, albedo_master) = self.albedo_reference();
         let size = crate::maps::TEX_SIZE;

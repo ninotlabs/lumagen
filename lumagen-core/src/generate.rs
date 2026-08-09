@@ -15,6 +15,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::data::{self, MapId};
 use crate::derive::{self, DeriveParams, DerivePath};
+use crate::height::HeightField;
 use crate::providers::{BackendParams, ImageProvider, ImageRequest, ImageSpec, RequestKind};
 
 /// How each map is produced for a given run (AI ⇄ derived per map).
@@ -36,6 +37,66 @@ pub struct GenerationPlan {
     /// `MapId::index()`. Used for every `DerivePath::Derived` map so the geometric maps honor
     /// the user's strength/invert/flip_y/radius/detail_routing.
     pub derive_params: [DeriveParams; 8],
+    /// Depth-model reconstruction config — applies to the AI geometric maps (Displacement =
+    /// macro height from the depth estimator(s); Normal = micro normal).
+    pub depth: DepthReconstruct,
+}
+
+/// Configuration for the depth-model reconstruction path (the depth=macro / normal=micro
+/// split). Drives the maps whose `DerivePath` is `Ai`: Displacement reconstructs a macro height
+/// from one or two depth estimators; Normal estimates a micro normal, high-passed to strip the
+/// macro the displacement already carries.
+#[derive(Clone, Debug)]
+pub struct DepthReconstruct {
+    /// Depth estimator endpoint slugs, `[global, detail]`. Two → blended best-of-both (robust
+    /// global structure from the first, finer macro detail from the second); one → used alone.
+    pub depth_models: Vec<String>,
+    /// Surface-normal estimator endpoint slug for the micro normal (default `fal-ai/patina`, a
+    /// texture→PBR extractor). Empty → derive the micro normal locally from the albedo instead
+    /// of calling a provider.
+    pub normal_model: String,
+    /// How to read the normal image from the estimator's response (PATINA tags it by
+    /// `map_type`; MiDaS uses a named field).
+    pub normal_output: crate::providers::EstimateOutput,
+    /// Extra params for the normal request (PATINA's `maps: ["normal"]` so it computes only the
+    /// normal). `Null` sends none.
+    pub normal_extra: serde_json::Value,
+    /// Path to a local Depth Anything V2 ONNX model for the offline `local:` depth engine
+    /// (requires the `onnx` build feature). `None` → the `local:` model errors with guidance.
+    pub local_model_path: Option<std::path::PathBuf>,
+    /// Invert the depth near/far convention.
+    pub invert: bool,
+    /// Best-of-both blend crossover as a FRACTION of side (resolution-independent) — the band
+    /// below which the global model is trusted and above which the detail model contributes.
+    pub blend_radius: f32,
+    /// Macro↔micro crossover as a FRACTION of side: the displacement keeps structure coarser
+    /// than this; finer detail is left to the micro normal. Larger = a broader, macro-only
+    /// displacement.
+    pub crossover_radius: f32,
+    /// Extra params merged into each depth request (Marigold's `ensemble_size`/
+    /// `num_inference_steps`/`processing_res`). `Null` sends none.
+    pub depth_extra: serde_json::Value,
+}
+
+impl Default for DepthReconstruct {
+    fn default() -> Self {
+        Self {
+            // PATINA's texture→PBR height is structure-aligned (tiles, seams) — unlike the
+            // scene-depth models, which read a flat albedo as soft blobs. Kept as the default;
+            // Marigold / Depth Anything remain selectable per material.
+            depth_models: vec!["fal-ai/patina".into()],
+            // PATINA (texture→PBR) supplies the micro normal; `maps: ["normal"]` so it computes
+            // only that. Cleared → local high-pass derivation instead.
+            normal_model: "fal-ai/patina".into(),
+            normal_output: crate::providers::EstimateOutput::MapType("normal".into()),
+            normal_extra: crate::providers::obj(&[("maps", serde_json::Value::Array(vec!["normal".into()]))]),
+            local_model_path: None,
+            invert: false,
+            blend_radius: 0.02,
+            crossover_radius: 0.01,
+            depth_extra: serde_json::Value::Null,
+        }
+    }
 }
 
 impl Default for GenerationPlan {
@@ -56,6 +117,7 @@ impl Default for GenerationPlan {
             retries: 3,
             size: Some(ImageSpec::Aspect("1:1".into())),
             derive_params: [DeriveParams::default(); 8],
+            depth: DepthReconstruct::default(),
         }
     }
 }
@@ -104,6 +166,11 @@ pub enum MapOutcome {
         /// The model's full-resolution square output `(rgba, side)`, kept for export quality.
         /// `None` when the source was already at (or below) the working size.
         master: Option<MasterPixels>,
+        /// The high-precision displacement height (`0..1` `f32`) when this outcome reconstructed
+        /// one — the depth-model macro path. Carried alongside the 8-bit `rgba` so export writes
+        /// a TRUE 16-bit/EXR displacement. `None` for every non-displacement map and for the
+        /// deterministic derived path (which re-derives its height at export resolution).
+        height: Option<HeightField>,
         /// Real cost where the provider reports it (OpenRouter); `None` otherwise.
         cost: Option<f64>,
     },
@@ -244,16 +311,28 @@ impl MapGenerator {
                     map: id,
                     rgba,
                     master: None,
+                    height: None,
                     cost: Some(0.0),
                 });
             }
         }
 
-        // ── 2. Semantic (AI) maps in the target set, concurrently via the provider ──
+        // ── 2. AI geometric maps via the depth-model path (Displacement = macro, Normal =
+        // micro) — reconstructed separately from the prompt-driven semantic maps below. ──
+        let ai_geometric = |id: MapId| target.contains(&id) && plan.paths[id.index()] == DerivePath::Ai;
+        let want_depth = ai_geometric(MapId::Displacement);
+        let want_normal = ai_geometric(MapId::Normal);
+        // The estimators read the highest-resolution albedo available (native master when
+        // present) so the reconstruction lands at export resolution. Captured here because the
+        // reference-PNG encode below consumes `albedo_master`.
+        let depth_src: Option<(Vec<u8>, usize)> =
+            (want_depth || want_normal).then(|| albedo_master.as_ref().map(|(p, s)| (p.clone(), *s)).unwrap_or_else(|| (albedo.clone(), size)));
+
+        // ── 3. Semantic (AI) maps (roughness/metallic/emission) concurrently via the provider ──
         let semantic: Vec<MapId> = MapId::DERIVED
             .iter()
             .copied()
-            .filter(|id| target.contains(id) && plan.paths[id.index()] == DerivePath::Ai)
+            .filter(|id| target.contains(id) && plan.paths[id.index()] == DerivePath::Ai && !matches!(id, MapId::Displacement | MapId::Normal))
             .collect();
 
         let ref_side = albedo_master.as_ref().map(|m| m.1).unwrap_or(size);
@@ -302,7 +381,13 @@ impl MapGenerator {
                 let result = Self::generate_with_retry(&*provider, &request, plan.retries, cancel, SquareMode::Stretch).await;
                 match result {
                     Ok((rgba, master, cost)) => {
-                        let _ = tx.send(MapOutcome::Ready { map, rgba, master, cost });
+                        let _ = tx.send(MapOutcome::Ready {
+                            map,
+                            rgba,
+                            master,
+                            height: None,
+                            cost,
+                        });
                     }
                     Err(e) => {
                         let _ = tx.send(MapOutcome::Failed { map, error: e.to_string() });
@@ -313,6 +398,73 @@ impl MapGenerator {
         .buffer_unordered(plan.max_concurrency.max(1));
 
         while let Some(()) = tasks.next().await {}
+
+        // ── 4. AI geometric reconstruction: depth = macro displacement, normal = micro. Run
+        // concurrently with each other; each honors its per-map cancel token. ──
+        if !cancel.is_cancelled()
+            && let Some((src_px, src_side)) = depth_src
+        {
+            let provider = &*self.provider;
+            let dep_cancel = tokens.get(&MapId::Displacement).cloned().unwrap_or_else(|| cancel.child_token());
+            let nrm_cancel = tokens.get(&MapId::Normal).cloned().unwrap_or_else(|| cancel.child_token());
+            let depth_fut = async {
+                if !want_depth {
+                    return;
+                }
+                match reconstruct_depth(provider, &src_px, src_side, &plan.depth, plan.retries, dep_cancel).await {
+                    Ok(hf) => {
+                        let working = crate::maps::TEX_SIZE;
+                        // 8-bit preview (working) + native 8-bit master for the contact sheet;
+                        // the f32 `height` master is what exports as TRUE 16-bit/EXR.
+                        let rgba = hf.resized(working).to_rgba8(false, 1.0, false);
+                        let native_rgba = hf.to_rgba8(false, 1.0, false);
+                        let side = hf.side();
+                        let master = (side > working).then_some((native_rgba, side));
+                        let _ = tx.send(MapOutcome::Ready {
+                            map: MapId::Displacement,
+                            rgba,
+                            master,
+                            height: Some(hf),
+                            cost: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(MapOutcome::Failed {
+                            map: MapId::Displacement,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            };
+            let normal_fut = async {
+                if !want_normal {
+                    return;
+                }
+                match reconstruct_micro_normal(provider, &src_px, src_side, &plan.depth, plan.retries, nrm_cancel).await {
+                    Ok(normal) => {
+                        let working = crate::maps::TEX_SIZE;
+                        let rgba = crate::maps::resize_square_rgba(&normal, src_side, working);
+                        let master = (src_side > working).then_some((normal, src_side));
+                        let _ = tx.send(MapOutcome::Ready {
+                            map: MapId::Normal,
+                            rgba,
+                            master,
+                            height: None,
+                            cost: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(MapOutcome::Failed {
+                            map: MapId::Normal,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            };
+            // `futures::future::join` (a function, not the `tokio::join!` macro whose expansion
+            // trips the workspace's disallowed-`expect` lint) runs both inline to completion.
+            futures::future::join(depth_fut, normal_fut).await;
+        }
     }
 
     /// Generate `count` variation candidates for one map in a single provider call
@@ -401,6 +553,7 @@ impl MapGenerator {
                     map: MapId::Albedo,
                     rgba,
                     master,
+                    height: None,
                     cost,
                 });
             }
@@ -467,6 +620,7 @@ impl MapGenerator {
                 map,
                 rgba: working,
                 master: (src_side > crate::maps::TEX_SIZE).then_some((src, src_side)),
+                height: None,
                 cost: Some(total_cost),
             },
             (Some(e), _) => MapOutcome::Failed {
@@ -719,11 +873,180 @@ fn decode_to_rgba(bytes: &[u8], mode: SquareMode) -> Result<(Vec<u8>, Option<Mas
     }
 }
 
+// ── Depth-model reconstruction (depth = macro, normal = micro) ──────────────
+
+/// Reconstruct the MACRO displacement height from the albedo via the configured depth
+/// estimator(s): run each through `provider.estimate`, decode to `f32`, blend best-of-both when
+/// two are given, then reduce to the macro band. Returns one normalized [`HeightField`] at the
+/// input side. Radii are fractions of side, so the result is resolution-independent.
+async fn reconstruct_depth(
+    provider: &dyn ImageProvider,
+    albedo: &[u8],
+    side: usize,
+    depth: &DepthReconstruct,
+    retries: usize,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<HeightField, crate::providers::ProviderError> {
+    let mut fields: Vec<HeightField> = Vec::with_capacity(depth.depth_models.len());
+    for model in &depth.depth_models {
+        fields.push(estimate_depth_field(provider, model, albedo, side, depth, retries, &cancel).await?);
+    }
+    let blend_r = ((side as f32 * depth.blend_radius).round() as usize).max(1);
+    let cross_r = ((side as f32 * depth.crossover_radius).round() as usize).max(1);
+    decode_blocking(move || {
+        let combined = match fields.as_slice() {
+            [] => return Err(crate::providers::ProviderError::Empty),
+            [single] => single.clone(),
+            [global, detail, ..] => crate::depth::blend_best_of(global, detail, blend_r),
+        };
+        Ok(crate::depth::to_macro(&combined, cross_r))
+    })
+    .await
+}
+
+/// fal's estimator endpoints (PATINA, and the depth models) reject inputs larger than
+/// 2048×2048 (`image_too_large`). The albedo master can exceed that (gpt-image 2880², Topaz
+/// upscales), so the reference sent to a hosted estimator is downscaled to fit; the estimated
+/// map is resized back up on decode. Macro depth is low-frequency, so the cap costs it nothing.
+const MAX_ESTIMATE_SIDE: usize = 2048;
+
+/// Downscale an albedo to at most [`MAX_ESTIMATE_SIDE`] for a hosted estimator request,
+/// returning `(rgba, side)` — unchanged when already within the cap.
+fn cap_estimate_input(albedo: &[u8], side: usize) -> (Vec<u8>, usize) {
+    if side <= MAX_ESTIMATE_SIDE {
+        (albedo.to_vec(), side)
+    } else {
+        (crate::maps::resize_square_rgba(albedo, side, MAX_ESTIMATE_SIDE), MAX_ESTIMATE_SIDE)
+    }
+}
+
+/// Produce one depth field from a single model slug: the offline `local:` engine (Depth
+/// Anything V2 via ONNX, true raw float) when the slug is prefixed `local:`, else the hosted
+/// estimator (Marigold / Depth Anything) decoded from its 8-bit PNG.
+async fn estimate_depth_field(
+    provider: &dyn ImageProvider,
+    model: &str,
+    albedo: &[u8],
+    side: usize,
+    depth: &DepthReconstruct,
+    retries: usize,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<HeightField, crate::providers::ProviderError> {
+    // `local:` routes to the offline ONNX engine (true raw float) instead of a provider.
+    if model.starts_with("local:") {
+        let Some(path) = depth.local_model_path.clone() else {
+            return Err(crate::providers::ProviderError::Job(
+                "local depth selected but no model path is configured (place a Depth Anything V2 ONNX in the cache)".into(),
+            ));
+        };
+        let invert = depth.invert;
+        let albedo = albedo.to_vec();
+        #[cfg(feature = "onnx")]
+        {
+            return decode_blocking(move || crate::onnx::reconstruct_local_depth(&path, &albedo, side, invert)).await;
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            // Keep the bindings live so the non-feature build has no unused-variable warnings.
+            let _ = (&path, invert, albedo.len(), side);
+            return Err(crate::providers::ProviderError::Job(
+                "local depth requires building Lumagen with the `onnx` feature (pure-Rust tract inference)".into(),
+            ));
+        }
+    }
+    // Downscale the reference to the endpoints' 2048² input cap; the decoded depth is resized
+    // back up in `reconstruct_depth`'s macro pass.
+    let (est_rgba, est_side) = cap_estimate_input(albedo, side);
+    // PATINA is a texture→PBR extractor: request only its HEIGHT map (aligned to the actual
+    // surface structure), read from the tagged `images[]` array. Scene-depth models (Marigold /
+    // Depth Anything) return a single top-level image.
+    let (extra, output) = if model.contains("patina") {
+        (
+            crate::providers::obj(&[("maps", serde_json::Value::Array(vec!["height".into()]))]),
+            crate::providers::EstimateOutput::MapType("height".into()),
+        )
+    } else {
+        (depth.depth_extra.clone(), crate::providers::EstimateOutput::Image)
+    };
+    let req = crate::providers::EstimateRequest {
+        map: MapId::Displacement,
+        rgba: est_rgba,
+        side: est_side,
+        model: model.to_string(),
+        extra,
+        output,
+    };
+    let progress: &crate::providers::ProgressFn = &|_p| {};
+    let resp = call_with_retry(retries, cancel, || provider.estimate(&req, cancel.child_token(), progress)).await?;
+    let img = resp.images.into_iter().next().ok_or(crate::providers::ProviderError::Empty)?;
+    let bytes = image_bytes(img).await?;
+    let invert = depth.invert;
+    decode_blocking(move || crate::depth::decode_depth(&bytes, invert).ok_or(crate::providers::ProviderError::Empty)).await
+}
+
+/// Reconstruct the MICRO normal from the albedo: estimate a surface normal via the configured
+/// model (or derive one locally when no slug is set), then high-pass to strip the macro tilt
+/// the displacement already carries. Returns an RGBA8 normal at the input side.
+async fn reconstruct_micro_normal(
+    provider: &dyn ImageProvider,
+    albedo: &[u8],
+    side: usize,
+    depth: &DepthReconstruct,
+    retries: usize,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<Vec<u8>, crate::providers::ProviderError> {
+    let normal = if depth.normal_model.trim().is_empty() {
+        let albedo = albedo.to_vec();
+        decode_blocking(move || Ok(derive::derive_map(MapId::Normal, &albedo, None, side, &DeriveParams::default()))).await?
+    } else {
+        // Downscale the reference to the endpoint's 2048² input cap (PATINA rejects larger);
+        // the returned normal is resized back up to the native `side` on decode.
+        let (est_rgba, est_side) = cap_estimate_input(albedo, side);
+        let req = crate::providers::EstimateRequest {
+            map: MapId::Normal,
+            rgba: est_rgba,
+            side: est_side,
+            model: depth.normal_model.clone(),
+            extra: depth.normal_extra.clone(),
+            output: depth.normal_output.clone(),
+        };
+        let progress: &crate::providers::ProgressFn = &|_p| {};
+        let resp = call_with_retry(retries, &cancel, || provider.estimate(&req, cancel.child_token(), progress)).await?;
+        let img = resp.images.into_iter().next().ok_or(crate::providers::ProviderError::Empty)?;
+        let bytes = image_bytes(img).await?;
+        decode_blocking(move || decode_normal_to_rgba(&bytes, side)).await?
+    };
+    let radius = ((side as f32 * depth.crossover_radius).round() as usize).max(1);
+    decode_blocking(move || Ok(derive::high_pass_normal(&normal, side, radius))).await
+}
+
+/// Decode a normals estimator's image into a square RGBA8 buffer at `side` (stretched to square
+/// for 1:1 registration with the albedo, like an edit result).
+fn decode_normal_to_rgba(bytes: &[u8], side: usize) -> Result<Vec<u8>, crate::providers::ProviderError> {
+    let img = image::load_from_memory(bytes).map_err(|e| crate::providers::ProviderError::Job(format!("normal decode: {e}")))?;
+    let (master, src) = crate::maps::stretch_square_rgba(&img);
+    Ok(crate::maps::resize_square_rgba(&master, src, side))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::providers::MockProvider;
     use std::sync::Arc;
+
+    /// The estimator input is downscaled to fal's 2048² ceiling (PATINA / the depth models
+    /// reject larger inputs with `image_too_large`), and passes through unchanged within it.
+    #[test]
+    fn cap_estimate_input_respects_the_2048_ceiling() {
+        let big = vec![128u8; 2880 * 2880 * 4];
+        let (rgba, side) = cap_estimate_input(&big, 2880);
+        assert_eq!(side, MAX_ESTIMATE_SIDE, "oversized master is capped");
+        assert_eq!(rgba.len(), MAX_ESTIMATE_SIDE * MAX_ESTIMATE_SIDE * 4, "buffer matches the capped side");
+        let small = vec![64u8; 1024 * 1024 * 4];
+        let (rgba, side) = cap_estimate_input(&small, 1024);
+        assert_eq!(side, 1024, "within the cap, side is unchanged");
+        assert_eq!(rgba.len(), 1024 * 1024 * 4);
+    }
 
     /// Timeout means an ACCEPTED job hit its deadline — it may still run (and bill)
     /// server-side, so a retry would submit a duplicate paid job. Never resubmit on it.
@@ -777,6 +1100,70 @@ mod tests {
             )
             .await;
         assert!(rx.recv().await.is_none(), "a cancelled batch must not emit outcomes");
+    }
+
+    /// Promoting Displacement + Normal to AI routes them through the depth-model path: the
+    /// displacement comes back carrying an `f32` height master (for a TRUE 16-bit/EXR export),
+    /// and the normal comes back with none — all offline via the mock estimator.
+    #[tokio::test]
+    async fn ai_geometric_maps_reconstruct_via_depth_path() {
+        let generator = MapGenerator::new(Arc::new(MockProvider));
+        let size = crate::maps::TEX_SIZE;
+        let layout = crate::maps::build_layout(4821);
+        let albedo = crate::maps::render_map(MapId::Albedo, &layout, 4821);
+        let mut paths = std::array::from_fn(|i| derive::default_path(MapId::ALL[i]));
+        paths[MapId::Displacement.index()] = DerivePath::Ai;
+        paths[MapId::Normal.index()] = DerivePath::Ai;
+        let plan = GenerationPlan {
+            paths,
+            ..GenerationPlan::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        generator
+            .generate_material(
+                albedo,
+                None,
+                size,
+                vec![MapId::Displacement, MapId::Normal],
+                PromptContext::default(),
+                plan,
+                4821,
+                std::collections::HashMap::new(),
+                tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+
+        let mut disp_has_height = false;
+        let mut normal_ready = false;
+        while let Some(o) = rx.recv().await {
+            match o {
+                MapOutcome::Ready {
+                    map: MapId::Displacement,
+                    rgba,
+                    height,
+                    ..
+                } => {
+                    assert_eq!(rgba.len(), size * size * 4, "displacement preview at working size");
+                    assert!(height.is_some(), "the depth path must carry an f32 height master");
+                    disp_has_height = true;
+                }
+                MapOutcome::Ready {
+                    map: MapId::Normal,
+                    rgba,
+                    height,
+                    ..
+                } => {
+                    assert_eq!(rgba.len(), size * size * 4, "normal at working size");
+                    assert!(height.is_none(), "the micro normal carries no height master");
+                    normal_ready = true;
+                }
+                MapOutcome::Failed { map, error } => panic!("{map:?} failed: {error}"),
+                _ => {}
+            }
+        }
+        assert!(disp_has_height, "displacement reconstructed via the depth path");
+        assert!(normal_ready, "normal reconstructed via the estimator path");
     }
 
     /// The chained upscale keeps the last pass's master for the final outcome.

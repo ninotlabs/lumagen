@@ -121,6 +121,78 @@ pub struct Version {
     pub master: Option<(std::sync::Arc<Vec<u8>>, usize)>,
 }
 
+/// Which model reconstructs the macro displacement when it's on the AI path. A per-material
+/// override. The default `Patina` uses the texture→PBR extractor's HEIGHT output, which is
+/// aligned to the actual surface structure (tiles, seams); the scene-depth models (Marigold /
+/// Depth Anything) are trained on photographs and read a flat orthographic albedo as vague soft
+/// blobs, so they're kept only as alternatives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DepthMode {
+    /// PATINA's texture→PBR height — structure-aligned; the same model that draws the normal.
+    Patina,
+    /// Run both scene-depth models, blended best-of-both.
+    Blend,
+    /// Marigold only (diffusion scene depth).
+    Marigold,
+    /// Depth Anything V2 only (robust, fast scene depth).
+    DepthAnything,
+    /// Local Depth Anything V2 via ONNX — offline, true raw float (needs the `onnx` build
+    /// feature + a local model).
+    Local,
+}
+
+impl DepthMode {
+    const PATINA: &'static str = "fal-ai/patina";
+    const MARIGOLD: &'static str = "fal-ai/imageutils/marigold-depth";
+    const DEPTH_ANYTHING: &'static str = "fal-ai/image-preprocessors/depth-anything/v2";
+    const LOCAL: &'static str = "local:depth-anything-v2";
+
+    /// The estimator slugs this mode drives, as `[global, detail]` for the blend. The `local:`
+    /// prefix routes to the offline ONNX engine; `fal-ai/patina` routes to its height output.
+    pub fn models(self) -> Vec<String> {
+        match self {
+            DepthMode::Patina => vec![Self::PATINA.into()],
+            DepthMode::Blend => vec![Self::DEPTH_ANYTHING.into(), Self::MARIGOLD.into()],
+            DepthMode::Marigold => vec![Self::MARIGOLD.into()],
+            DepthMode::DepthAnything => vec![Self::DEPTH_ANYTHING.into()],
+            DepthMode::Local => vec![Self::LOCAL.into()],
+        }
+    }
+
+    /// UI label.
+    pub fn label(self) -> &'static str {
+        match self {
+            DepthMode::Patina => "PATINA (texture)",
+            DepthMode::Blend => "Blend (scene depth)",
+            DepthMode::Marigold => "Marigold",
+            DepthMode::DepthAnything => "Depth Anything",
+            DepthMode::Local => "Local (ONNX)",
+        }
+    }
+
+    /// Stable persistence discriminant.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            DepthMode::Blend => 0,
+            DepthMode::Marigold => 1,
+            DepthMode::DepthAnything => 2,
+            DepthMode::Local => 3,
+            DepthMode::Patina => 4,
+        }
+    }
+
+    /// Inverse of [`Self::to_u8`]; unknown values fall back to `Patina` (the default).
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => DepthMode::Blend,
+            1 => DepthMode::Marigold,
+            2 => DepthMode::DepthAnything,
+            3 => DepthMode::Local,
+            _ => DepthMode::Patina,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MapState {
     pub status: MapStatus,
@@ -138,6 +210,8 @@ pub struct MapState {
     pub bit_depth_16: bool,
     pub fidelity: f32,
     pub detail_routing: f32, // macro ↔ micro split (10 = displacement owns 10%)
+    /// Which depth model(s) drive an AI-path displacement (Displacement only; ignored elsewhere).
+    pub depth_mode: DepthMode,
 }
 
 impl MapState {
@@ -154,6 +228,7 @@ impl MapState {
             bit_depth_16: crate::data::map_def(id).bits == 16,
             fidelity: 0.96,
             detail_routing: 10.0,
+            depth_mode: DepthMode::Patina,
         }
     }
 
@@ -494,6 +569,10 @@ pub struct AppState {
     /// Pixels are `Arc`-shared (never mutated in place) so save/derive/version snapshots
     /// clone the handle, not the buffer.
     pub master_pixels: HashMap<MapId, (std::sync::Arc<Vec<u8>>, usize)>,
+    /// High-precision displacement height masters (`0..1` `f32`) from the depth-model macro
+    /// path, keyed by map (only Displacement uses it today). Parallel to `master_pixels`: the
+    /// 8-bit master drives the UI/contact sheet, this drives a TRUE 16-bit/EXR export.
+    pub master_height: HashMap<MapId, lumagen_core::height::HeightField>,
     /// GPU textures of the masters, uploaded on demand so the 2D viewport shows native
     /// resolution instead of the soft 400² working copy.
     pub master_textures: HashMap<MapId, TextureHandle>,
@@ -709,6 +788,7 @@ impl AppState {
             lib_previews: HashMap::new(),
             map_pixels: HashMap::new(),
             master_pixels: HashMap::new(),
+            master_height: HashMap::new(),
             master_textures: HashMap::new(),
             gen_size: 0,
             queue: Vec::new(),
@@ -912,6 +992,7 @@ impl AppState {
         self.thumbs.clear();
         self.map_pixels.clear();
         self.master_pixels.clear();
+        self.master_height.clear();
         self.master_encoded.clear();
         self.master_textures.clear();
     }
@@ -926,6 +1007,16 @@ impl AppState {
     }
 
     pub fn toast(&mut self, msg: impl Into<String>, kind: ToastKind) {
+        // Cap the length. A provider/API error can echo a multi-megabyte base64 data URI (fal's
+        // 422 mirrors the input image), and a toast that long makes egui tessellate tens of
+        // millions of glyph quads — overflowing its per-frame index buffer and hard-crashing the
+        // wgpu backend. No toast needs more than a couple of lines.
+        const MAX_TOAST_CHARS: usize = 300;
+        let mut msg: String = msg.into();
+        if let Some((cut, _)) = msg.char_indices().nth(MAX_TOAST_CHARS) {
+            msg.truncate(cut);
+            msg.push('…');
+        }
         self.toasts.push(msg, kind);
     }
 
@@ -1294,6 +1385,7 @@ impl AppState {
             locked: m.status == MapStatus::Locked,
             ai_path: m.derive_path == DerivePath::Ai,
             version_seeds: m.versions.iter().map(|v| v.seed).collect(),
+            depth_mode: m.depth_mode.to_u8(),
         }
     }
 
@@ -1391,6 +1483,7 @@ impl AppState {
                 path: path.clone(),
                 doc,
                 maps,
+                displacement_height: self.master_height.get(&MapId::Displacement).cloned(),
                 announce,
             })),
         );
@@ -1684,7 +1777,13 @@ impl AppState {
     fn apply_generated(&mut self, ctx: &egui::Context, outcome: lumagen_core::generate::MapOutcome) {
         use lumagen_core::generate::MapOutcome;
         match outcome {
-            MapOutcome::Ready { map, rgba, master, cost } => {
+            MapOutcome::Ready {
+                map,
+                rgba,
+                master,
+                height,
+                cost,
+            } => {
                 let was_upscale = self.upscaling.remove(&map);
                 // Only a generation result may retire generation state — an upscale finishing
                 // mid-regeneration must not clobber the regen's cancel token or progress.
@@ -1694,6 +1793,13 @@ impl AppState {
                 let px = std::sync::Arc::new(rgba);
                 self.install_pixels(ctx, map, std::sync::Arc::clone(&px));
                 self.set_master(map, master.map(|(mpx, side)| (std::sync::Arc::new(mpx), side)));
+                // Keep the f32 displacement master for a TRUE 16-bit/EXR export. A displacement
+                // result WITHOUT one (derived, upscaled, imported) supersedes any stale height.
+                if let Some(h) = height {
+                    self.master_height.insert(map, h);
+                } else if map == MapId::Displacement {
+                    self.master_height.remove(&map);
+                }
                 let seed = self.seed;
                 let master_arc = self.master_pixels.get(&map).cloned();
                 self.push_version(map, seed, Some(px), master_arc);
@@ -2929,6 +3035,11 @@ impl AppState {
         }
         self.layout = maps::build_layout(self.seed);
         self.reset_maps_and_stores();
+        // Restore the reconstructed displacement height (16-bit section) so a reopened material
+        // still exports a TRUE 16-bit/EXR displacement instead of falling back to 8-bit/re-derive.
+        if let Some(hf) = doc.displacement_height() {
+            self.master_height.insert(MapId::Displacement, hf);
+        }
         let fallback_seed = self.seed;
         for id in MapId::ALL {
             // Maps the document never touched keep the default-policy path.
@@ -2946,6 +3057,7 @@ impl AppState {
                 m.bit_depth_16 = mapdoc.bit_depth_16;
                 m.fidelity = mapdoc.fidelity;
                 m.detail_routing = mapdoc.detail_routing;
+                m.depth_mode = DepthMode::from_u8(mapdoc.depth_mode);
                 m.active_version = mapdoc.active_version;
                 // The document's per-map path wins (the Path toggle persists per material);
                 // a never-generated map falls back to the default policy.

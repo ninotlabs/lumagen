@@ -68,6 +68,36 @@ pub(crate) fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
     url.strip_prefix("data:")?.split_once(";base64,")
 }
 
+/// Sanitize an upstream error body for display/logging. fal's 4xx responses **echo the input
+/// image** (`"input":"data:image/png;base64,<megabytes>"`), so a raw error can be many MB — and
+/// rendering it in the UI makes egui tessellate tens of millions of glyph quads, overflowing its
+/// index buffer and hard-crashing the wgpu backend. Cut any base64 payload down to a marker,
+/// then cap the length so no error string can ever reach the UI oversized.
+pub(crate) fn sanitize_error_body(body: &str) -> String {
+    const CAP: usize = 600;
+    // Replace each inline base64 payload (`;base64,<run>`) with a short marker.
+    let mut cleaned = String::with_capacity(body.len().min(2048));
+    let mut rest = body;
+    while let Some(pos) = rest.find(";base64,") {
+        let start = pos + ";base64,".len();
+        cleaned.push_str(&rest[..start]);
+        cleaned.push_str("<truncated>");
+        // The base64 run ends at the next quote/brace/bracket (JSON) or the end.
+        let end = rest[start..].find(['"', '}', ']']).map_or(rest.len(), |q| start + q);
+        rest = &rest[end..];
+    }
+    cleaned.push_str(rest);
+    // Cap the total length at a char boundary.
+    match cleaned.char_indices().nth(CAP) {
+        Some((cut, _)) => {
+            let mut s = cleaned[..cut].to_string();
+            s.push('…');
+            s
+        }
+        None => cleaned,
+    }
+}
+
 /// A text-only chat completion against any OpenAI-compatible endpoint (OpenAI, OpenRouter, a
 /// local Ollama server, …). Used by the optional LLM-powered Material Description Check to
 /// improve a material description. Returns the assistant's message text.
@@ -493,7 +523,7 @@ impl ImageData {
                 if !status.is_success() {
                     return Err(ProviderError::Api {
                         status: status.as_u16(),
-                        message: resp.text().await.unwrap_or_default(),
+                        message: sanitize_error_body(&resp.text().await.unwrap_or_default()),
                         kind: None,
                     });
                 }
@@ -572,6 +602,48 @@ pub struct UpscaleRequest {
     pub model: String,
 }
 
+/// A request to run a single-image **estimator/preprocessor** — depth (Marigold, Depth
+/// Anything) or surface normals — that takes one image and returns one image. Unlike
+/// [`ImageRequest`] (prompt-driven, returns an `images` array) and [`UpscaleRequest`] (Topaz
+/// factor), these fal endpoints take `{ image_url, … }` and return a single `image` File.
+///
+/// The depth path reconstructs the **macro** relief; a normals estimator reconstructs the
+/// **micro** detail. Both hosted fal endpoints return 8-bit PNG — genuine `f32` macro relief
+/// is recovered downstream by low-passing (averaging many 8-bit samples yields sub-LSB
+/// precision, and the quantized high frequencies are exactly what the macro pass discards).
+#[derive(Clone, Debug)]
+pub struct EstimateRequest {
+    /// Which map this estimation feeds (labeling/telemetry).
+    pub map: MapId,
+    /// Source RGBA8 pixels (square) — the albedo the estimator reads.
+    pub rgba: Vec<u8>,
+    /// Source side length.
+    pub side: usize,
+    /// The estimator endpoint id (e.g. `fal-ai/imageutils/marigold-depth`,
+    /// `fal-ai/image-preprocessors/depth-anything/v2`, `fal-ai/patina`). Configurable per the
+    /// same rule as generation slugs — never hardcoded as the only option.
+    pub model: String,
+    /// Endpoint-specific params merged into the request body (Marigold's `ensemble_size`,
+    /// `num_inference_steps`, `processing_res`; PATINA's `maps`; `Null` sends none).
+    pub extra: serde_json::Value,
+    /// Which result the endpoint returns and how to pick the wanted image from it. Depth models
+    /// return a single top-level `image`; PATINA returns a tagged `images[]` array.
+    pub output: EstimateOutput,
+}
+
+/// How an estimator's response carries the wanted image — endpoints differ, so the caller
+/// declares which shape to read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EstimateOutput {
+    /// A single top-level `image` File — Marigold, Depth Anything.
+    Image,
+    /// A single named top-level File field, e.g. `normal_map` / `depth_map` — MiDaS.
+    Field(String),
+    /// The entry in an `images[]` array whose `map_type` equals this — PATINA (a multi-map
+    /// PBR extractor returning one tagged image per requested map).
+    MapType(String),
+}
+
 /// Estimated cost of one Topaz upscale by OUTPUT megapixels (fal's published tier table:
 /// $0.08 ≤ 24MP, $0.16 ≤ 48MP, $0.32 ≤ 96MP, up to $1.36 for 512MP).
 pub fn topaz_cost_estimate(target_side: usize) -> f64 {
@@ -603,6 +675,18 @@ pub trait ImageProvider: Send + Sync {
         _progress: &ProgressFn,
     ) -> Result<ImageResponse, ProviderError> {
         Err(ProviderError::Job("upscaling is not supported by this backend — fal.ai drives Topaz".into()))
+    }
+
+    /// Run a single-image estimator/preprocessor — depth (Marigold / Depth Anything) or
+    /// surface normals — that returns one image. fal submits to the endpoint queue; the mock
+    /// derives an offline stand-in from the albedo; backends without estimators error.
+    async fn estimate(
+        &self,
+        _req: &EstimateRequest,
+        _cancel: tokio_util::sync::CancellationToken,
+        _progress: &ProgressFn,
+    ) -> Result<ImageResponse, ProviderError> {
+        Err(ProviderError::Job("depth/normal estimation is not supported by this backend".into()))
     }
 
     /// Which backend this is.
@@ -748,6 +832,22 @@ mod tests {
             assert_eq!(bytes, b"not-really-png");
             assert_eq!(mime, "application/json", "mime comes from the content-type header");
         }
+    }
+
+    /// A fal 4xx body echoes the multi-MB base64 input image; sanitizing must strip the payload
+    /// and cap the length, while keeping the useful message and passing short bodies through —
+    /// so a megabyte error can never reach the UI and overflow egui's index buffer.
+    #[test]
+    fn sanitize_error_body_strips_base64_and_caps_length() {
+        let huge = "A".repeat(2_000_000);
+        let body = format!(r#"{{"detail":[{{"msg":"Image dimensions are too large. Maximum 2048x2048","input":"data:image/png;base64,{huge}"}}]}}"#);
+        let out = super::sanitize_error_body(&body);
+        assert!(out.chars().count() <= 601, "must be capped, got {}", out.chars().count());
+        assert!(out.contains("too large"), "keeps the useful message");
+        assert!(out.contains("<truncated>"), "base64 payload replaced with a marker");
+        assert!(!out.contains(&"A".repeat(1000)), "no long base64 run survives");
+        // A short, base64-free body passes through unchanged.
+        assert_eq!(super::sanitize_error_body("invalid API key"), "invalid API key");
     }
 
     /// The shared download client builds once and is reusable.

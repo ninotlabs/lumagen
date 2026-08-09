@@ -32,6 +32,7 @@ fn base_job(maps: [Option<Vec<u8>>; 8]) -> ExportJob {
         directx_normal: false,
         displacement_16bit_png: false,
         displacement_exr: false,
+        displacement_height: None,
         seed: 1,
         prompt: String::new(),
         seam_margin: 0,

@@ -94,6 +94,9 @@ pub struct SaveJob {
     /// The document with identity/prompt fields set and NO maps yet.
     pub doc: lumagen_core::document::Document,
     pub maps: Vec<SaveMap>,
+    /// The depth-reconstructed displacement height master (f32), persisted as a 16-bit section
+    /// so a TRUE 16-bit/EXR displacement survives save/load. `None` when derived on demand.
+    pub displacement_height: Option<lumagen_core::height::HeightField>,
     /// Whether to toast on success (explicit Ctrl+S yes; silent autosave no).
     pub announce: bool,
 }
@@ -467,9 +470,18 @@ fn run_worker(rx: Receiver<Task>, tx: Sender<Output>, ctx: egui::Context) {
                 // detail into the export, off the UI thread.
                 if let Some((albedo, side)) = albedo_src {
                     for (id, params) in derive_missing {
-                        let rgba = lumagen_core::derive::derive_map(id, &albedo, None, side, &params);
-                        job.maps[id.index()] = Some(rgba);
-                        job.map_sizes[id.index()] = side;
+                        if id == MapId::Displacement {
+                            // Keep the displacement in full f32 so export writes a TRUE
+                            // 16-bit/EXR file; the 8-bit buffer is only for the contact sheet.
+                            let hf = lumagen_core::derive::displacement_height_field_from_albedo(&albedo, side, &params);
+                            job.maps[id.index()] = Some(hf.to_rgba8(false, 1.0, false));
+                            job.map_sizes[id.index()] = side;
+                            job.displacement_height = Some(hf);
+                        } else {
+                            let rgba = lumagen_core::derive::derive_map(id, &albedo, None, side, &params);
+                            job.maps[id.index()] = Some(rgba);
+                            job.map_sizes[id.index()] = side;
+                        }
                     }
                 }
                 let result = lumagen_core::export::export_material(&job, &dir)
@@ -478,7 +490,13 @@ fn run_worker(rx: Receiver<Task>, tx: Sender<Output>, ctx: egui::Context) {
                 Output::Io(IoResult::Exported(result))
             }
             Task::Io(IoTask::SaveDoc(job)) => {
-                let SaveJob { path, mut doc, maps, announce } = *job;
+                let SaveJob {
+                    path,
+                    mut doc,
+                    maps,
+                    displacement_height,
+                    announce,
+                } = *job;
                 // A map that fails to encode fails the whole save — a document silently
                 // missing a map would masquerade as a good backup. Untouched masters pass
                 // their stored PNG section through byte-identical (no decode/re-encode).
@@ -497,6 +515,12 @@ fn run_worker(rx: Receiver<Task>, tx: Sender<Output>, ctx: egui::Context) {
                             doc.set_map_encoded(m.id, (*png).clone(), preview, m.side, m.params);
                             Ok(())
                         }
+                    })
+                    // Persist the f32 displacement height (16-bit section) so the reopened
+                    // material still exports a TRUE 16-bit/EXR displacement.
+                    .and_then(|()| match &displacement_height {
+                        Some(hf) => doc.set_displacement_height(hf),
+                        None => Ok(()),
                     })
                     .and_then(|()| doc.save(&path))
                     .map_err(|e| error_chain(&e));

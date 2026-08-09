@@ -105,6 +105,11 @@ pub struct ExportJob {
     pub displacement_16bit_png: bool,
     /// Displacement as 32-bit-float EXR (the default for Blender/Generic); 16-bit PNG otherwise.
     pub displacement_exr: bool,
+    /// High-precision displacement source (0..1 `f32`) from the derivation/depth path. When
+    /// present, the displacement map is encoded from this — a **true** 16-bit PNG / 32-bit-float
+    /// EXR — instead of the 8-bit RGBA in `maps`, which can only ever carry 256 levels. `None`
+    /// falls back to the 8-bit buffer (imported/materialized displacement with no float master).
+    pub displacement_height: Option<crate::height::HeightField>,
     /// Shared project seed (recorded in the manifest).
     pub seed: u32,
     /// The compiled prompt / description used (recorded in the manifest for provenance).
@@ -416,6 +421,14 @@ pub fn export_material(job: &ExportJob, out_dir: &Path) -> Result<Vec<PathBuf>> 
         }
     }
 
+    // The high-precision displacement source, resized + seam-blended in float so its geometry
+    // matches the 8-bit maps' — a true 16-bit/EXR displacement quantized exactly once.
+    let disp_field: Option<crate::height::HeightField> = job.displacement_height.as_ref().map(|hf| {
+        let mut hf = hf.resized(job.out_size);
+        hf.make_seamless(job.seam_margin);
+        hf
+    });
+
     for def in &MAPS {
         let Some(px) = &resized[def.id.index()] else { continue };
         // Only the normal map is transformed for output (and `resized` must stay pristine
@@ -437,12 +450,20 @@ pub fn export_material(job: &ExportJob, out_dir: &Path) -> Result<Vec<PathBuf>> 
 
         let (file, bit_depth) = if def.id == MapId::Displacement && job.displacement_exr {
             let path = out_dir.join(format!("{stem}.exr"));
-            write_exr(&path, &px, job.out_size)?;
+            // Real f32 EXR from the height master when we have one; the 8-bit ×257 fallback is
+            // only reached for an imported/materialized displacement with no float source.
+            match &disp_field {
+                Some(hf) => hf.write_exr(&path)?,
+                None => write_exr(&path, &px, job.out_size)?,
+            }
             written.push(path);
             (format!("{stem}.exr"), 32u8)
         } else if def.id == MapId::Displacement && job.displacement_16bit_png {
             let path = out_dir.join(format!("{stem}.png"));
-            write_png16(&path, &px, job.out_size)?;
+            match &disp_field {
+                Some(hf) => hf.write_png16(&path)?,
+                None => write_png16(&path, &px, job.out_size)?,
+            }
             written.push(path);
             (format!("{stem}.png"), 16)
         } else {
@@ -552,6 +573,7 @@ mod tests {
             directx_normal: false,
             displacement_16bit_png: false,
             displacement_exr: false,
+            displacement_height: None,
             seed: 4821,
             prompt: "painted hull".into(),
             seam_margin: 0,
@@ -564,6 +586,58 @@ mod tests {
         assert!(written.iter().any(|p| p.ends_with("README.md")));
         assert!(written.iter().any(|p| p.to_string_lossy().contains("albedo")));
         assert!(written.iter().any(|p| p.to_string_lossy().contains("roughness")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end proof that a displacement backed by an `f32` height master exports as a TRUE
+    /// 16-bit PNG — far more than the 256 levels the 8-bit ×257 fallback can hold. The
+    /// precision must survive the whole export path (resize + seam + encode), not just the
+    /// encoder in isolation.
+    #[test]
+    fn displacement_height_master_exports_true_16bit() {
+        use std::collections::HashSet;
+
+        let side = 128;
+        // A fine f32 gradient — every sample a distinct level, so the encoder's precision is
+        // what caps the output level count, not the input's.
+        let n = (side * side) as f32;
+        let data: Vec<f32> = (0..side * side).map(|i| i as f32 / (n - 1.0)).collect();
+        let hf = crate::height::HeightField::from_vec(data, side).expect("square");
+
+        let mut maps: [Option<Vec<u8>>; 8] = Default::default();
+        maps[MapId::Albedo.index()] = Some(solid(side, 180));
+        maps[MapId::Displacement.index()] = Some(hf.to_rgba8(false, 1.0, false));
+
+        let job = ExportJob {
+            maps,
+            map_sizes: [0; 8],
+            src_size: side,
+            out_size: side,
+            material: "grad".into(),
+            res: "1k".into(),
+            pattern: "$map".into(),
+            engine: EngineConvention::Generic,
+            directx_normal: false,
+            displacement_16bit_png: true,
+            displacement_exr: false,
+            displacement_height: Some(hf),
+            seed: 1,
+            prompt: String::new(),
+            seam_margin: 0,
+        };
+        let dir = std::env::temp_dir().join(format!("lumagen_disp_true_16bit_{}", std::process::id()));
+        export_material(&job, &dir).expect("export");
+
+        let png = std::fs::read(dir.join("displacement.png")).expect("displacement png");
+        let decoder = png::Decoder::new(std::io::Cursor::new(png));
+        let mut reader = decoder.read_info().expect("read info");
+        let mut buf = vec![0u8; reader.output_buffer_size().expect("buffer size")];
+        let info = reader.next_frame(&mut buf).expect("frame");
+        assert_eq!(info.bit_depth, png::BitDepth::Sixteen, "displacement must export as real 16-bit");
+        let valid = info.line_size * info.height as usize;
+        let levels: HashSet<u16> = buf[..valid].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        assert!(levels.len() > 256, "true 16-bit displacement resolves {} levels (>256)", levels.len());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

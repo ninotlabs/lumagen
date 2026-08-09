@@ -9,13 +9,17 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::disallowed_methods))]
 
 pub mod data;
+pub mod depth;
 pub mod derive;
 pub mod document;
 pub mod error;
 pub mod export;
 pub mod generate;
+pub mod height;
 pub mod library;
 pub mod maps;
+#[cfg(feature = "onnx")]
+pub mod onnx;
 pub mod promptpack;
 pub mod providers;
 

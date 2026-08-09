@@ -31,6 +31,11 @@ pixel-aligned to the albedo, and exports engine-ready PNG/EXR textures.
 [lints]
 workspace = true
 
+[features]
+# Build with the local (offline) Depth Anything V2 ONNX depth engine (pure-Rust tract
+# inference). Off by default — the hosted Marigold / Depth Anything path needs no extra deps.
+onnx = ["lumagen-core/onnx"]
+
 [dependencies]
 lumagen-core = { path = "lumagen-core" }
 # egui family pinned in lockstep per the eframe/egui skills (verified 0.34.2 API);
