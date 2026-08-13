@@ -35,14 +35,14 @@ workspace = true
 lumagen-core = { path = "lumagen-core" }
 # egui family pinned in lockstep per the eframe/egui skills (verified 0.34.2 API);
 # wgpu pinned exactly as the skills mandate.
-eframe = { version = "=0.35.0", default-features = false, features = [
+eframe = { version = "=0.36.1", default-features = false, features = [
     "wgpu",
     "default_fonts",
     "persistence",
 ] }
-egui = "=0.35.0"
-egui_extras = { version = "=0.35.0", features = ["image"] }
-egui-wgpu = "=0.35.0"
+egui = "=0.36.1"
+egui_extras = { version = "=0.36.1", features = ["image"] }
+egui-wgpu = "=0.36.1"
 egui-phosphor = { version = "0.13", features = ["regular", "bold", "fill"] }
 wgpu = "=29.0.4"
 # Vertex/uniform POD casting for the hand-rolled wgpu PBR preview (Phase 4).
@@ -80,7 +80,7 @@ winresource = "0.1"
 [dev-dependencies]
 # Headless UI rendering for the visual-review tests (tests/ui_screens.rs): each screen is
 # rendered off-screen via wgpu and written to target/ui_shots for inspection.
-egui_kittest = { version = "=0.35.0", features = ["wgpu"] }
+egui_kittest = { version = "=0.36.1", features = ["wgpu"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
