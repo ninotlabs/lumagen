@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 # Color type shared with the UI. egui is a heavyweight but reusing its Color32 keeps the
 # mock renderer's API unchanged for now; a future cleanup can swap in a tiny color type.
-egui = "=0.34.2"
+egui = "=0.36.2"
 # png for map encode/decode; jpeg because real providers may return JPEG payloads.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 png = "0.18"
